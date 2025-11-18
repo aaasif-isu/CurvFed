@@ -151,7 +151,7 @@ class ResNet18_server_side(nn.Module):
         self.layer4 = self._layer(block, 128, num_layers[0], stride = 2)
         self.layer5 = self._layer(block, 256, num_layers[1], stride = 2)
         self.layer6 = self._layer(block, 512, num_layers[2], stride = 2)
-        self. averagePool = nn.AvgPool2d(kernel_size = 7, stride = 1)
+        self.averagePool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(512 * block.expansion, classes)
         
         for m in self.modules():
@@ -178,18 +178,16 @@ class ResNet18_server_side(nn.Module):
         return nn.Sequential(*netLayers)
         
     
-    def forward(self, x):
-        out2 = self.layer3(x)
-        out2 = out2 + x          # adding the resudial inputs -- downsampling not required in this layer
-        x3 = F.relu(out2)
+    def forward(self, x3):
         
-        x4 = self. layer4(x3)
+        x3 = self.layer3(x3)
+        x4 = self.layer4(x3)
         x5 = self.layer5(x4)
         x6 = self.layer6(x5)
         
-        x7 = F.avg_pool2d(x6, 7)
-        x8 = x7.view(x7.size(0), -1) 
-        y_hat =self.fc(x8)
+        x7 = self.averagePool(x6)            
+        x8 = torch.flatten(x7, 1)            
+        y_hat = self.fc(x8)
         
         return y_hat
 
@@ -464,6 +462,16 @@ class Client(object):
                 #---------forward prop-------------
                 fx = net(images)
                 client_fx = fx.clone().detach().requires_grad_(True)
+                # --- Save smashed features for EMD analysis ---
+                with torch.no_grad():
+                    _fx = fx.detach().cpu()
+                    _fx = _fx.view(_fx.size(0), -1)  # flatten spatial dims
+                    _take = min(256, _fx.size(0))
+                    _idx = torch.randperm(_fx.size(0))[:_take]
+                    os.makedirs("smashed", exist_ok=True)
+                    torch.save(_fx[_idx], f"smashed/client{self.idx}_round{iter}.pt")
+                # --- End save ---
+
                 
                 # Sending activations to server and receiving gradients from server
                 dfx = train_server(client_fx, labels, iter, self.local_ep, self.idx, len_batch)
