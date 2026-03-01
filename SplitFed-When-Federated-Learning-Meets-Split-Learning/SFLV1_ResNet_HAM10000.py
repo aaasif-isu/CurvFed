@@ -46,7 +46,16 @@ if torch.cuda.is_available():
 program = "SFLV1 ResNet18 on HAM10000"
 print(f"---------{program}----------")              # this is to identify the program in the slurm outputs files
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+if device.type == "cuda":
+    print("CUDA available:", torch.cuda.is_available())
+    print("GPU Name:", torch.cuda.get_device_name(0))
+    print("GPU Capability OK!")
+else:
+    print("WARNING: Not running on GPU")
+
+
 
 # To print in color -------test/train of the client side
 def prRed(skk): print("\033[91m {}\033[00m" .format(skk)) 
@@ -446,7 +455,24 @@ class Client(object):
         self.lr = lr
         self.local_ep = 1
         #self.selected_clients = []
-        self.ldr_train = DataLoader(DatasetSplit(dataset_train, idxs), batch_size = 256, shuffle = True)
+        self.ldr_train = DataLoader(
+        DatasetSplit(dataset_train, idxs),
+        batch_size=128,
+        shuffle=True,
+        num_workers=8,
+        pin_memory=True,
+        persistent_workers=True
+        )
+        self.ldr_test = DataLoader(
+        DatasetSplit(dataset_test, idxs_test),
+        batch_size=128,
+        shuffle=False,
+        num_workers=8,
+        pin_memory=True,
+        persistent_workers=True
+    )
+        
+
         self.ldr_test = DataLoader(DatasetSplit(dataset_test, idxs_test), batch_size = 256, shuffle = True)
         
 
@@ -468,8 +494,10 @@ class Client(object):
                     _fx = _fx.view(_fx.size(0), -1)  # flatten spatial dims
                     _take = min(256, _fx.size(0))
                     _idx = torch.randperm(_fx.size(0))[:_take]
-                    os.makedirs("smashed", exist_ok=True)
-                    torch.save(_fx[_idx], f"smashed/client{self.idx}_round{iter}.pt")
+                    outdir = f"smashed/client_{self.idx}"
+                    os.makedirs(outdir, exist_ok=True)
+                    torch.save(_fx[_idx], f"{outdir}/round_{iter}.pt")
+
                 # --- End save ---
 
                 
@@ -516,7 +544,7 @@ def dataset_iid(dataset, num_users):
 #=============================================================================
 #                         Data loading 
 #============================================================================= 
-df = pd.read_csv('data/HAM10000_metadata.csv')
+df = pd.read_csv('data/HAM10000/HAM10000_metadata.csv')
 print(df.head())
 
 
@@ -531,8 +559,14 @@ lesion_type = {
 }
 
 # merging both folders of HAM1000 dataset -- part1 and part2 -- into a single directory
-imageid_path = {os.path.splitext(os.path.basename(x))[0]: x
-                for x in glob(os.path.join("data", '*', '*.jpg'))}
+# Correct image directory on Nova cluster
+image_dir = "data/HAM10000/HAM10000_images"
+
+imageid_path = {
+    os.path.splitext(os.path.basename(x))[0]: x
+    for x in glob(os.path.join(image_dir, '*.jpg'))
+}
+
 
 
 #print("path---------------------------------------", imageid_path.get)
@@ -564,8 +598,18 @@ class SkinData(Dataset):
         
         return X, y
 #=============================================================================
-# Train-test split          
-train, test = train_test_split(df, test_size = 0.2)
+# Train-test split 
+train, test = train_test_split(
+    df,
+    test_size=0.2,
+    random_state=SEED,
+    stratify=df["dx"]
+)
+
+# Use only 20% of TRAIN data
+train = train.sample(frac=0.20, random_state=SEED).reset_index(drop=True)
+print("Train size:", len(train), "Test size:", len(test))         
+# train, test = train_test_split(df, test_size = 0.2)
 
 train = train.reset_index()
 test = test.reset_index()
