@@ -1,3 +1,9 @@
+__pycache__/
+*.pyc
+
+# environments
+curvfed_env/
+
 # datasets
 data/
 HAM10000/
@@ -18,8 +24,3 @@ distrib/
 # result files
 *.npy
 *.xlsx
-
-# environment and system files
-curvfed_env/
-__pycache__/
-.DS_Store
