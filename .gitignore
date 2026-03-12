@@ -1,0 +1,26 @@
+__pycache__/
+*.pyc
+
+# environments
+curvfed_env/
+
+# datasets
+data/
+HAM10000/
+MNIST/
+
+# training artifacts
+smashed/
+distrib/
+
+# model weights
+*.pt
+*.pth
+
+# logs
+*.txt
+*.log
+
+# result files
+*.npy
+*.xlsx
