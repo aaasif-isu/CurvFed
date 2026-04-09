@@ -20,7 +20,13 @@ distrib/
 # logs
 *.txt
 *.log
+logs/
 
 # result files
 *.npy
 *.xlsx
+*.json
+*.png
+
+# Mac / system files
+.DS_Store

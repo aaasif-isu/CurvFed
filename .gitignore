@@ -6,10 +6,14 @@ MNIST/
 # training artifacts
 smashed/
 distrib/
+logs/
+checkpoints/
 
 # model weights
 *.pt
 *.pth
+*.json
+*.png
 
 # logs
 *.txt
