@@ -2,9 +2,13 @@ import json, numpy as np, pathlib
 import networkx as nx
 import matplotlib.pyplot as plt
 
+
 # --- load artifacts ---
-emd = np.load("emd_matrix.npy")
-edge_kappa = json.loads(pathlib.Path("ricci_edges.json").read_text())
+HERE = pathlib.Path(__file__).resolve().parent
+ROOT = HERE.parent
+
+emd = np.load(ROOT / "emd_matrix.npy")
+edge_kappa = json.loads((HERE / "ricci_edges.json").read_text())
 
 # rebuild the same k-NN graph (k=3)
 n = emd.shape[0]

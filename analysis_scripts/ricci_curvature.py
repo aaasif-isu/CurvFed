@@ -12,7 +12,7 @@ except Exception as e:
     ) from e
 
 HERE = os.path.dirname(__file__)
-emd_path = os.path.join(HERE, "emd_matrix.npy")
+emd_path = os.path.join(HERE, "..", "emd_matrix.npy")
 if not os.path.exists(emd_path):
     raise FileNotFoundError(f"Missing {emd_path}. Run compute_emd_matrix.py first.")
 
