@@ -1,29 +1,24 @@
-# datasets
-data/
-HAM10000/
-MNIST/
+# system
+.DS_Store
 
-# training artifacts
+# environments
+curvfed_env/
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+
+# generated data / outputs
+data/
 smashed/
 distrib/
 logs/
 checkpoints/
 
-# model weights
-*.pt
-*.pth
+*.log
+*.xlsx
+*.npy
 *.json
 *.png
-
-# logs
-*.txt
-*.log
-
-# result files
-*.npy
-*.xlsx
-
-# environment and system files
-curvfed_env/
-__pycache__/
-.DS_Store
+*.pth
