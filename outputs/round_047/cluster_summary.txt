@@ -1,0 +1,16 @@
+Cluster assignments by client
+Client 0 -> Cluster 0
+Client 1 -> Cluster 2
+Client 2 -> Cluster 0
+Client 3 -> Cluster 0
+Client 4 -> Cluster 0
+Client 5 -> Cluster 0
+Client 6 -> Cluster 1
+Client 7 -> Cluster 1
+Client 8 -> Cluster 0
+Client 9 -> Cluster 0
+
+Cluster groups
+Cluster 0: [0, 2, 3, 4, 5, 8, 9]
+Cluster 1: [6, 7]
+Cluster 2: [1]
