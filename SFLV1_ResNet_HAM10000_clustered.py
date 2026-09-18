@@ -21,6 +21,11 @@ from sklearn.model_selection import train_test_split
 from PIL import Image
 from glob import glob
 from pandas import DataFrame
+import json
+from sklearn.cluster import AgglomerativeClustering
+import ot
+import networkx as nx
+from GraphRicciCurvature.OllivierRicci import OllivierRicci
 
 import random
 import numpy as np
@@ -34,13 +39,20 @@ import copy
 
 
 SEED = 42
+
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
-torch.cuda.manual_seed(SEED)
+
 if torch.cuda.is_available():
-    torch.backends.cudnn.deterministic = True
-    print(torch.cuda.get_device_name(0))    
+    torch.cuda.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+    print(torch.cuda.get_device_name(0))  
+
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+  
 
 #===================================================================
 program = "SFLV1 ResNet18 on HAM10000"
@@ -212,17 +224,17 @@ print(net_glob_server)
 # For Server Side Loss and Accuracy 
 loss_train_collect = []
 acc_train_collect = []
+
 loss_test_collect = []
 acc_test_collect = []
+
 batch_acc_train = []
 batch_loss_train = []
-batch_acc_test = []
-batch_loss_test = []
 
 
 criterion = nn.CrossEntropyLoss()
 count1 = 0
-count2 = 0
+# count2 = 0
 #====================================================================================================
 #                                  Server Side Program
 #====================================================================================================
@@ -234,6 +246,209 @@ def FedAvg(w):
             w_avg[k] += w[i][k]
         w_avg[k] = torch.div(w_avg[k], len(w))
     return w_avg
+
+def make_round_dirs(global_round):
+    round_name = f"round_{global_round + 1:03d}"
+    smashed_dir = os.path.join("smashed", round_name)
+    out_dir = os.path.join("outputs", round_name)
+    distrib_dir = os.path.join(out_dir, "distrib")
+
+    os.makedirs(smashed_dir, exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(distrib_dir, exist_ok=True)
+
+    return smashed_dir, out_dir, distrib_dir
+
+
+
+def build_distrib_for_round(smashed_dir, distrib_dir):
+    client_batches = {}
+
+    for fname in sorted(os.listdir(smashed_dir)):
+        if not (fname.startswith("client_") and fname.endswith(".pt")):
+            continue
+
+        parts = fname.replace(".pt", "").split("_")
+        client_id = int(parts[1])
+
+        x = torch.load(
+            os.path.join(smashed_dir, fname),
+            map_location="cpu"
+        ).float()
+
+        if x.dim() > 2:
+            x = x.view(x.size(0), -1)
+
+        client_batches.setdefault(client_id, []).append(x)
+
+    for client_id, tensors in client_batches.items():
+        x_all = torch.cat(tensors, dim=0)
+
+        # Fixed-size representation for comparable EMD computation
+        if x_all.size(0) > 256:
+            generator = torch.Generator().manual_seed(SEED + client_id)
+            selected = torch.randperm(
+                x_all.size(0),
+                generator=generator
+            )[:256]
+            x_all = x_all[selected]
+
+        torch.save(
+            x_all,
+            os.path.join(distrib_dir, f"client{client_id}.pt")
+        )
+
+
+def compute_emd_for_round(distrib_dir, out_dir):
+    files = sorted(glob(os.path.join(distrib_dir, "client*.pt")))
+    if len(files) != num_users:
+        raise RuntimeError(f"Expected {num_users} client distribution files, found {len(files)} in {distrib_dir}")
+    Xs = []
+
+    for f in files:
+        X = torch.load(f, map_location="cpu").float().numpy()
+        X = (X - X.mean(0, keepdims=True)) / (X.std(0, keepdims=True) + 1e-8)
+        Xs.append(X)
+
+    k = len(Xs)
+    emd = np.zeros((k, k), dtype=np.float64)
+
+    for i in range(k):
+        Xi, wi = Xs[i], ot.unif(len(Xs[i]))
+        for j in range(i + 1, k):
+            Xj, wj = Xs[j], ot.unif(len(Xs[j]))
+            M = ot.dist(Xi, Xj, metric="euclidean")
+            emd[i, j] = emd[j, i] = float(ot.emd2(wi, wj, M))
+
+    np.save(os.path.join(out_dir, "emd_matrix.npy"), emd)
+
+    with open(os.path.join(out_dir, "emd_matrix_readable.txt"), "w") as f:
+        f.write(f"Shape: {emd.shape}\n\n")
+        for row in emd:
+            f.write(" ".join([f"{v:.4f}" for v in row]) + "\n")
+
+    return emd
+
+
+def compute_ricci_for_round(emd, out_dir):
+    n = emd.shape[0]
+    positives = emd[np.triu_indices(n, 1)]
+    tau = np.median(positives[positives > 0]) if np.any(positives > 0) else 1.0
+
+    sim = np.exp(-emd / max(tau, 1e-8))
+    np.fill_diagonal(sim, 0.0)
+
+    G = nx.Graph()
+    k = min(3, n - 1)
+
+    for i in range(n):
+        G.add_node(i)
+        nbrs = np.argsort(sim[i])[::-1][:k]
+        for j in nbrs:
+            if i != j:
+                G.add_edge(i, j, weight=float(sim[i, j]), distance=float(emd[i, j]))
+
+    ricci = OllivierRicci(G, alpha=0.5, method="OTD", verbose="ERROR")
+    Gk = ricci.compute_ricci_curvature()
+
+    edge_kappa = {}
+    for u, v in Gk.edges():
+        edge_kappa[f"{u}-{v}"] = float(Gk[u][v].get("ricciCurvature", 0.0))
+
+    with open(os.path.join(out_dir, "ricci_edges.json"), "w") as f:
+        json.dump(edge_kappa, f, indent=2)
+    return Gk
+
+
+def cluster_clients_from_ricci(Gk, out_dir, n_clusters=3):
+    n = Gk.number_of_nodes()
+
+    ricci_distance = np.ones((n, n), dtype=np.float64)
+
+    np.fill_diagonal(ricci_distance, 0.0)
+
+    for u, v, data in Gk.edges(data=True):
+        curvature = float(data.get("ricciCurvature", 0.0))
+
+        # Higher curvature = stronger structural similarity.
+        # Convert it to a non-negative distance.
+        distance = max(0.0, 1.0 - curvature)
+
+        ricci_distance[u, v] = distance
+        ricci_distance[v, u] = distance
+
+    try:
+        model = AgglomerativeClustering(
+            n_clusters=n_clusters,
+            metric="precomputed",
+            linkage="average"
+        )
+    except TypeError:
+        model = AgglomerativeClustering(
+            n_clusters=n_clusters,
+            affinity="precomputed",
+            linkage="average"
+        )
+
+    labels = model.fit_predict(ricci_distance)
+
+    cluster_groups = {}
+
+    for client_id, cluster_id in enumerate(labels):
+        cluster_groups.setdefault(
+            int(cluster_id),
+            []
+        ).append(client_id)
+
+    with open(
+        os.path.join(out_dir, "cluster_summary.txt"),
+        "w"
+    ) as f:
+
+        f.write("Ricci-based client clustering\n\n")
+
+        for client_id, cluster_id in enumerate(labels):
+            f.write(
+                f"Client {client_id} -> "
+                f"Cluster {cluster_id}\n"
+            )
+
+        f.write("\nCluster groups\n")
+
+        for cluster_id, clients in sorted(
+            cluster_groups.items()
+        ):
+            f.write(
+                f"Cluster {cluster_id}: "
+                f"{clients}\n"
+            )
+
+    np.savetxt(
+        os.path.join(out_dir, "client_clusters.txt"),
+        labels,
+        fmt="%d"
+    )
+
+    return labels, cluster_groups
+
+
+def clusterwise_fedavg(server_weights_by_id, cluster_groups):
+    cluster_models = []
+
+    for cluster_id, client_ids in sorted(cluster_groups.items()):
+
+        cluster_weights = [
+            server_weights_by_id[client_id]
+            for client_id in client_ids
+        ]
+
+        cluster_model = FedAvg(cluster_weights)
+        cluster_models.append(cluster_model)
+
+    # Only after ALL clusters have been averaged
+    final_global_model = FedAvg(cluster_models)
+
+    return final_global_model, cluster_models
 
 
 def calculate_accuracy(fx, y):
@@ -247,16 +462,14 @@ acc_avg_all_user_train = 0
 loss_avg_all_user_train = 0
 loss_train_collect_user = []
 acc_train_collect_user = []
-loss_test_collect_user = []
-acc_test_collect_user = []
+# loss_test_collect_user = []
+# acc_test_collect_user = []
 
 w_glob_server = net_glob_server.state_dict()
-w_locals_server = []
+server_weights_by_id =  {}
 
 #client idx collector
 idx_collect = []
-l_epoch_check = False
-fed_check = False
 # Initialization of net_model_server and net_server (server-side model)
 net_model_server = [net_glob_server for i in range(num_users)]
 net_server = copy.deepcopy(net_model_server[0]).to(device)
@@ -264,9 +477,15 @@ net_server = copy.deepcopy(net_model_server[0]).to(device)
 
 # Server-side function associated with Training 
 def train_server(fx_client, y, l_epoch_count, l_epoch, idx, len_batch):
-    global net_model_server, criterion, optimizer_server, device, batch_acc_train, batch_loss_train, l_epoch_check, fed_check
-    global loss_train_collect, acc_train_collect, count1, acc_avg_all_user_train, loss_avg_all_user_train, idx_collect, w_locals_server, w_glob_server, net_server
-    global loss_train_collect_user, acc_train_collect_user, lr
+    global net_model_server, criterion, optimizer_server
+    global device, batch_acc_train, batch_loss_train
+    global loss_train_collect, acc_train_collect, count1
+    global acc_avg_all_user_train, loss_avg_all_user_train
+    global idx_collect, w_glob_server, net_server
+    global loss_train_collect_user
+    global acc_train_collect_user
+    global lr
+    global server_weights_by_id
     
     net_server = copy.deepcopy(net_model_server[idx]).to(device)
     net_server.train()
@@ -316,9 +535,9 @@ def train_server(fx_client, y, l_epoch_count, l_epoch, idx, len_batch):
         # If one local epoch is completed, after this a new client will come
         if l_epoch_count == l_epoch-1:
             
-            l_epoch_check = True                # to evaluate_server function - to check local epoch has completed or not 
+            # l_epoch_check = True                # to evaluate_server function - to check local epoch has completed or not 
             # We store the state of the net_glob_server() 
-            w_locals_server.append(copy.deepcopy(w_server))
+            server_weights_by_id[idx] = copy.deepcopy(w_server)
             
             # we store the last accuracy in the last batch of the epoch and it is not the average of all local epochs
             # this is because we work on the last trained model and its accuracy (not earlier cases)
@@ -338,99 +557,30 @@ def train_server(fx_client, y, l_epoch_count, l_epoch, idx, len_batch):
         
         # This is for federation process--------------------
         if len(idx_collect) == num_users:
-            fed_check = True                                                  # to evaluate_server function  - to check fed check has hitted
-            # Federation process at Server-Side------------------------- output print and update is done in evaluate_server()
-            # for nicer display 
-                                   
-            w_glob_server = FedAvg(w_locals_server)   
-            
-            # server-side global model update and distribute that model to all clients ------------------------------
-            net_glob_server.load_state_dict(w_glob_server)    
-            net_model_server = [net_glob_server for i in range(num_users)]
-            
-            w_locals_server = []
-            idx_collect = []
-            
-            acc_avg_all_user_train = sum(acc_train_collect_user)/len(acc_train_collect_user)
-            loss_avg_all_user_train = sum(loss_train_collect_user)/len(loss_train_collect_user)
-            
+        
+        # All clients have completed training for this global round.
+        # Do NOT perform FedAvg here.
+        # Aggregation will happen later after EMD + ORC + clustering.
+
+            acc_avg_all_user_train = (
+                sum(acc_train_collect_user) /
+                len(acc_train_collect_user)
+            )
+            loss_avg_all_user_train = (
+                sum(loss_train_collect_user) /
+                len(loss_train_collect_user)
+            )
             loss_train_collect.append(loss_avg_all_user_train)
             acc_train_collect.append(acc_avg_all_user_train)
             
             acc_train_collect_user = []
             loss_train_collect_user = []
             
+            idx_collect = []
+            
     # send gradients to the client               
     return dfx_client
 
-# Server-side functions associated with Testing
-def evaluate_server(fx_client, y, idx, len_batch, ell):
-    global net_model_server, criterion, batch_acc_test, batch_loss_test, check_fed, net_server, net_glob_server 
-    global loss_test_collect, acc_test_collect, count2, num_users, acc_avg_train_all, loss_avg_train_all, w_glob_server, l_epoch_check, fed_check
-    global loss_test_collect_user, acc_test_collect_user, acc_avg_all_user_train, loss_avg_all_user_train
-    
-    net = copy.deepcopy(net_model_server[idx]).to(device)
-    net.eval()
-  
-    with torch.no_grad():
-        fx_client = fx_client.to(device)
-        y = y.to(device) 
-        #---------forward prop-------------
-        fx_server = net(fx_client)
-        
-        # calculate loss
-        loss = criterion(fx_server, y)
-        # calculate accuracy
-        acc = calculate_accuracy(fx_server, y)
-        
-        
-        batch_loss_test.append(loss.item())
-        batch_acc_test.append(acc.item())
-        
-               
-        count2 += 1
-        if count2 == len_batch:
-            acc_avg_test = sum(batch_acc_test)/len(batch_acc_test)
-            loss_avg_test = sum(batch_loss_test)/len(batch_loss_test)
-            
-            batch_acc_test = []
-            batch_loss_test = []
-            count2 = 0
-            
-            prGreen('Client{} Test =>                   \tAcc: {:.3f} \tLoss: {:.4f}'.format(idx, acc_avg_test, loss_avg_test))
-            
-            # if a local epoch is completed   
-            if l_epoch_check:
-                l_epoch_check = False
-                
-                # Store the last accuracy and loss
-                acc_avg_test_all = acc_avg_test
-                loss_avg_test_all = loss_avg_test
-                        
-                loss_test_collect_user.append(loss_avg_test_all)
-                acc_test_collect_user.append(acc_avg_test_all)
-                
-            # if federation is happened----------                    
-            if fed_check:
-                fed_check = False
-                print("------------------------------------------------")
-                print("------ Federation process at Server-Side ------- ")
-                print("------------------------------------------------")
-                
-                acc_avg_all_user = sum(acc_test_collect_user)/len(acc_test_collect_user)
-                loss_avg_all_user = sum(loss_test_collect_user)/len(loss_test_collect_user)
-            
-                loss_test_collect.append(loss_avg_all_user)
-                acc_test_collect.append(acc_avg_all_user)
-                acc_test_collect_user = []
-                loss_test_collect_user= []
-                              
-                print("====================== SERVER V1==========================")
-                print(' Train: Round {:3d}, Avg Accuracy {:.3f} | Avg Loss {:.3f}'.format(ell, acc_avg_all_user_train, loss_avg_all_user_train))
-                print(' Test: Round {:3d}, Avg Accuracy {:.3f} | Avg Loss {:.3f}'.format(ell, acc_avg_all_user, loss_avg_all_user))
-                print("==========================================================")
-         
-    return 
 
 #==============================================================================================================
 #                                       Clients-side Program
@@ -459,24 +609,24 @@ class Client(object):
         DatasetSplit(dataset_train, idxs),
         batch_size=128,
         shuffle=True,
-        num_workers=8,
+        num_workers=4,
         pin_memory=True,
         persistent_workers=True
         )
-        self.ldr_test = DataLoader(
-        DatasetSplit(dataset_test, idxs_test),
-        batch_size=128,
-        shuffle=False,
-        num_workers=8,
-        pin_memory=True,
-        persistent_workers=True
-    )
+    #     self.ldr_test = DataLoader(
+    #     DatasetSplit(dataset_test, idxs_test),
+    #     batch_size=128,
+    #     shuffle=False,
+    #     num_workers=8,
+    #     pin_memory=True,
+    #     persistent_workers=True
+    # )
         
 
-        # self.ldr_test = DataLoader(DatasetSplit(dataset_test, idxs_test), batch_size = 256, shuffle = True)
+    
         
 
-    def train(self, net):
+    def train(self, net, smashed_dir=None):
         net.train()
         optimizer_client = torch.optim.Adam(net.parameters(), lr = self.lr) 
         
@@ -492,11 +642,12 @@ class Client(object):
                 with torch.no_grad():
                     _fx = fx.detach().cpu()
                     _fx = _fx.view(_fx.size(0), -1)  # flatten spatial dims
-                    _take = min(256, _fx.size(0))
-                    _idx = torch.randperm(_fx.size(0))[:_take]
-                    outdir = f"smashed/client_{self.idx}"
-                    os.makedirs(outdir, exist_ok=True)
-                    torch.save(_fx[_idx], f"{outdir}/round_{iter}.pt")
+                    # _take = min(256, _fx.size(0))
+                    # _idx = torch.randperm(_fx.size(0))[:_take]
+                    if smashed_dir is not None:
+                        os.makedirs(smashed_dir, exist_ok=True)
+                        torch.save(_fx,os.path.join(smashed_dir,f"client_{self.idx}_batch_{batch_idx}.pt")
+                        )
 
                 # --- End save ---
 
@@ -512,34 +663,105 @@ class Client(object):
             #prRed('Client{} Train => Epoch: {}'.format(self.idx, ell))
            
         return net.state_dict() 
-    
-    def evaluate(self, net, ell):
-        net.eval()
-           
-        with torch.no_grad():
-            len_batch = len(self.ldr_test)
-            for batch_idx, (images, labels) in enumerate(self.ldr_test):
-                images, labels = images.to(self.device), labels.to(self.device)
-                #---------forward prop-------------
-                fx = net(images)
-                
-                # Sending activations to server 
-                evaluate_server(fx, labels, self.idx, len_batch, ell)
-            
-            #prRed('Client{} Test => Epoch: {}'.format(self.idx, ell))
-            
-        return          
+
+# ============================================================
+# Global evaluation after cluster-wise server FedAvg
+# ============================================================
+
+def evaluate_global_model(client_models_by_id, global_server_model, dataset_test):
+    """
+    Evaluate the final server model after cluster-wise FedAvg.
+
+    Because client-side models are NOT federated averaged, each client's
+    current client-side model is paired with the same final global server
+    model and evaluated on the identical test dataset.
+
+    The reported result is the average across all client/server pairs.
+    """
+
+    test_loader = DataLoader(
+        dataset_test,
+        batch_size=128,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
+    )
+
+    criterion_eval = nn.CrossEntropyLoss()
+
+    client_accuracies = []
+    client_losses = []
+
+    global_server_model.eval()
+
+    with torch.no_grad():
+
+        for client_id in sorted(client_models_by_id.keys()):
+
+            client_model = copy.deepcopy(
+                client_models_by_id[client_id]
+            ).to(device)
+
+            client_model.eval()
+
+            total_correct = 0
+            total_samples = 0
+            total_loss = 0.0
+
+            for images, labels in test_loader:
+
+                images = images.to(device)
+                labels = labels.to(device)
+
+                # Client-side forward pass
+                smashed = client_model(images)
+
+                # Final aggregated server-side forward pass
+                outputs = global_server_model(smashed)
+
+                loss = criterion_eval(outputs, labels)
+
+                predictions = outputs.argmax(dim=1)
+
+                total_correct += (
+                    predictions == labels
+                ).sum().item()
+
+                total_samples += labels.size(0)
+
+                total_loss += (
+                    loss.item() * labels.size(0)
+                )
+
+            accuracy = (
+                100.0 * total_correct / total_samples
+            )
+
+            avg_loss = (
+                total_loss / total_samples
+            )
+
+            client_accuracies.append(accuracy)
+            client_losses.append(avg_loss)
+
+    mean_accuracy = float(np.mean(client_accuracies))
+    mean_loss = float(np.mean(client_losses))
+
+    return mean_accuracy, mean_loss
+
+
 #=====================================================================================================
 # dataset_iid() will create a dictionary to collect the indices of the data samples randomly for each client
 # IID HAM10000 datasets will be created based on this
-# def dataset_iid(dataset, num_users):
+def dataset_iid(dataset, num_users):
     
-#     num_items = int(len(dataset)/num_users)
-#     dict_users, all_idxs = {}, [i for i in range(len(dataset))]
-#     for i in range(num_users):
-#         dict_users[i] = set(np.random.choice(all_idxs, num_items, replace = False))
-#         all_idxs = list(set(all_idxs) - dict_users[i])
-#     return dict_users    
+    num_items = int(len(dataset)/num_users)
+    dict_users, all_idxs = {}, [i for i in range(len(dataset))]
+    for i in range(num_users):
+        dict_users[i] = set(np.random.choice(all_idxs, num_items, replace = False))
+        all_idxs = list(set(all_idxs) - dict_users[i])
+    return dict_users    
+
 
 def dataset_noniid_dirichlet(
     labels,
@@ -567,15 +789,10 @@ def dataset_noniid_dirichlet(
                 np.cumsum(proportions)[:-1] * len(class_indices)
             ).astype(int)
 
-            class_splits = np.split(
-                class_indices,
-                split_points
-            )
+            class_splits = np.split(class_indices, split_points)
 
             for user_id, indices in enumerate(class_splits):
-                dict_users[user_id].extend(
-                    indices.tolist()
-                )
+                dict_users[user_id].extend(indices.tolist())
 
         client_sizes = [
             len(dict_users[user_id])
@@ -648,8 +865,11 @@ class SkinData(Dataset):
         
         return X, y
 #=============================================================================
-# Train-test split 
+# ============================================================
+# Train-test split
+# ============================================================
 
+# First create a fixed stratified 80/20 split
 train_full, test = train_test_split(
     df,
     test_size=0.20,
@@ -657,6 +877,7 @@ train_full, test = train_test_split(
     stratify=df["dx"]
 )
 
+# Use only 20% of the TRAIN partition (still stratified)
 train, _ = train_test_split(
     train_full,
     train_size=0.20,
@@ -671,20 +892,11 @@ print("Full dataset:", len(df))
 print("Training subset (20% of train):", len(train))
 print("Test set:", len(test))
 
-# train, test = train_test_split(
-#     df,
-#     test_size=0.2,
-#     random_state=SEED,
-#     stratify=df["dx"]
-# )
+print("\nTraining class distribution:")
+print(train["dx"].value_counts().sort_index())
 
-# # Use only 20% of TRAIN data
-# train = train.sample(frac=0.20, random_state=SEED).reset_index(drop=True)
-# print("Train size:", len(train), "Test size:", len(test))         
-# # train, test = train_test_split(df, test_size = 0.2)
-
-# train = train.reset_index()
-# test = test.reset_index()
+print("\nTest class distribution:")
+print(test["dx"].value_counts().sort_index())
 
 #=============================================================================
 #                         Data preprocessing
@@ -717,9 +929,7 @@ dataset_test = SkinData(test, transform = test_transforms)
 #----------------------------------------------------------------
 alpha = 0.1
 
-train_labels = train["target"].to_numpy(
-    dtype=np.int64
-)
+train_labels = train["target"].to_numpy(dtype=np.int64)
 
 dict_users = dataset_noniid_dirichlet(
     labels=train_labels,
@@ -728,9 +938,8 @@ dict_users = dataset_noniid_dirichlet(
     seed=SEED,
     min_samples_per_client=1
 )
-all_test_indices = set(
-    range(len(dataset_test))
-)
+
+all_test_indices = set(range(len(dataset_test)))
 
 dict_users_test = {
     user_id: all_test_indices.copy()
@@ -747,58 +956,217 @@ print(
     f"Using HAM10000 Non-IID training split: "
     f"alpha={alpha}, seed={SEED}"
 )
-
 print("Valid clients:", len(valid_users))
-print(
-    "Identical test samples per client:",
-    len(all_test_indices)
+print("Identical test samples per client:", len(all_test_indices))
+
+print("\n========== Non-IID client distributions ==========")
+
+client_distribution_summary = {}
+
+for user_id in range(num_users):
+    client_indices = sorted(dict_users[user_id])
+    client_labels = train_labels[client_indices]
+
+    class_counts = np.bincount(
+        client_labels,
+        minlength=7
+    )
+
+    client_distribution_summary[str(user_id)] = {
+        "num_samples": len(client_indices),
+        "class_counts": class_counts.tolist(),
+        "indices": client_indices
+    }
+
+    print(
+        f"Client {user_id:2d} | "
+        f"samples={len(client_indices):4d} | "
+        f"class counts={class_counts.tolist()}"
+    )
+
+partition_metadata = {
+    "dataset": "HAM10000",
+    "seed": SEED,
+    "alpha": alpha,
+    "num_users": num_users,
+    "training_subset": "20 percent of the original training partition",
+    "test_protocol": "identical full test set for every client",
+    "clients": client_distribution_summary
+}
+
+partition_file = (
+    "HAM10000_noniid_alpha01_seed42_"
+    "20pct_10clients_partition.json"
 )
+
+with open(partition_file, "w") as file:
+    json.dump(partition_metadata, file, indent=2)
+
+print("Saved client partition to:", partition_file)
 
 
 #------------ Training And Testing  -----------------
 net_glob_client.train()
 #copy weights
 w_glob_client = net_glob_client.state_dict()
+
+# Persistent client-side models.
+# No FedAvg is performed on the client side.
+client_models_by_id = {
+    client_id: copy.deepcopy(net_glob_client).to(device)
+    for client_id in valid_users
+}
 # Federation takes place after certain local epochs in train() client-side
 # this epoch is global epoch, also known as rounds
-for iter in range(epochs):
+for global_round in range(epochs):
+    print(f"\n========== Global Round {global_round + 1}/{epochs} ==========")
+
+    smashed_dir, out_dir, distrib_dir = make_round_dirs(global_round)
+    
     m = min(
         max(int(frac * num_users), 1),
         len(valid_users)
-    )
-    if m == len(valid_users):
-        idxs_users = np.array(
-            sorted(valid_users),
-            dtype=np.int64
         )
+    if m == len(valid_users):
+        idxs_users = np.array(sorted(valid_users), dtype=np.int64)
     else:
-        idxs_users = np.random.choice(
+        round_rng = np.random.default_rng(SEED + global_round)
+        idxs_users = round_rng.choice(
             valid_users,
-            m,
+            size=m,
             replace=False
         )
-    w_locals_client = []
-      
+    
+    # client_weights_by_id = {}
+    # w_locals_client = []
+
     for idx in idxs_users:
-        local = Client(net_glob_client, idx, lr, device, dataset_train = dataset_train, dataset_test = dataset_test, idxs = dict_users[idx], idxs_test = dict_users_test[idx])
-        # Training ------------------
-        w_client = local.train(net = copy.deepcopy(net_glob_client).to(device))
-        w_locals_client.append(copy.deepcopy(w_client))
-        
-        # Testing -------------------
-        local.evaluate(net = copy.deepcopy(net_glob_client).to(device), ell= iter)
-        
-            
-    # Ater serving all clients for its local epochs------------
-    # Fed  Server: Federation process at Client-Side-----------
+        local = Client(
+            net_glob_client,
+            idx,
+            lr,
+            device,
+            dataset_train=dataset_train,
+            dataset_test=dataset_test,
+            idxs=dict_users[idx],
+            idxs_test=dict_users_test[idx]
+        )
+
+        # Start from this client's own model from the previous round.
+        client_model = copy.deepcopy(
+            client_models_by_id[idx]
+        ).to(device)
+        w_client = local.train(
+            net=client_model,
+            smashed_dir=smashed_dir
+        )
+        # Keep the updated client-side model for the next round.
+        client_models_by_id[idx].load_state_dict(
+            copy.deepcopy(w_client)
+        )
+
+        # local.evaluate(
+        #     net=copy.deepcopy(net_glob_client).to(device),
+        #     ell=global_round
+        # )
+
     print("-----------------------------------------------------------")
-    print("------ FedServer: Federation process at Client-Side ------- ")
-    print("-----------------------------------------------------------")
-    w_glob_client = FedAvg(w_locals_client)   
+    print("------ Round-wise EMD + ORC + Cluster FedAvg -------------")
+    print("-----------------------------------------------------------")  
     
-    # Update client-side global model 
-    net_glob_client.load_state_dict(w_glob_client)    
+    # 1. Build one smashed-data distribution per client
+    build_distrib_for_round(
+        smashed_dir,
+        distrib_dir
+    )
+
+    # 2. Calculate pairwise EMD
+    emd = compute_emd_for_round(
+        distrib_dir,
+        out_dir
+    )
+
+    # 3. Build client similarity graph + calculate ORC
+    ricci_graph = compute_ricci_for_round(
+        emd,
+        out_dir
+    )
+
+    # 4. Use Ricci/graph structure to create clusters
+    labels, cluster_groups = cluster_clients_from_ricci(
+        ricci_graph,
+        out_dir,
+        n_clusters=3
+    )
+
+    print(
+        f"Round {global_round + 1} cluster groups:",
+        cluster_groups
+    )
+
+    # =========================================================
+    # CLUSTER-WISE FEDAVG — SERVER SIDE ONLY
+    # =========================================================
+
+    w_glob_server, cluster_models_server = clusterwise_fedavg(
+        server_weights_by_id,
+        cluster_groups
+    )
+
+    # Update global server model
+    net_glob_server.load_state_dict(w_glob_server)
+
+    # Use this global server model in next round
+    net_model_server = [
+        copy.deepcopy(net_glob_server)
+        for _ in range(num_users)
+    ]
+
+    # =========================================================
+    # Evaluate the final model produced by this round
+    # =========================================================
+
+    round_test_accuracy, round_test_loss = evaluate_global_model(
+        client_models_by_id,
+        net_glob_server,
+        dataset_test
+    )
+    acc_test_collect.append(round_test_accuracy)
+    loss_test_collect.append(round_test_loss)
     
+    print(
+        f"Round {global_round + 1}: "
+        f"Train Accuracy = {acc_avg_all_user_train:.3f}% | "
+        f"Test Accuracy = {round_test_accuracy:.3f}% | "
+        f"Test Loss = {round_test_loss:.4f}"
+    )
+
+    # Save each cluster model
+    for cluster_id, cluster_model in enumerate(cluster_models_server):
+        torch.save(
+            cluster_model,
+            os.path.join(
+                out_dir,
+                f"server_cluster_model_{cluster_id}.pth"
+            )
+        )
+
+    # Save final global server model
+    torch.save(
+        w_glob_server,
+        os.path.join(
+            out_dir,
+            f"server_global_model_round_{global_round + 1:03d}.pth"
+        )
+    )
+
+    print(
+        f"Round {global_round + 1}: "
+        "cluster-wise server FedAvg completed."
+    )
+
+    # Reset only after aggregation
+    server_weights_by_id = {}
 #===================================================================================     
 
 print("Training and Evaluation completed!")    

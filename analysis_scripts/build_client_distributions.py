@@ -2,7 +2,7 @@ import os, glob, torch
 os.makedirs("distrib", exist_ok=True)
 
 by_client = {}
-for f in glob.glob("smashed/client_*/*.pt"):
+for f in glob.glob("final_results_noniid_alpha_0.1/HAM10000_base/smashed/client_*/*.pt"):
     cid = int(os.path.basename(os.path.dirname(f)).replace("client_",""))
     x = torch.load(f, map_location="cpu")  # (n, D)
     by_client.setdefault(cid, []).append(x)

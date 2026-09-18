@@ -11,7 +11,7 @@
 # ============================================================================
 import torch
 from torch import nn
-from torchvision import transforms
+from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, Dataset
 import torch.nn.functional as F
 import math
@@ -25,6 +25,9 @@ from pandas import DataFrame
 import random
 import numpy as np
 import os
+import time
+from config import CONFIG
+from experiment_support import build_charlstm, load_configured_datasets
 
 
 import matplotlib
@@ -33,7 +36,7 @@ import matplotlib.pyplot as plt
 import copy
 
 
-SEED = 42
+SEED = CONFIG.seed
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
@@ -43,30 +46,32 @@ if torch.cuda.is_available():
     print(torch.cuda.get_device_name(0))    
 
 #===================================================================
-program = "SFLV1 ResNet18 on HAM10000"
+program = f"SFLV1 {CONFIG.model} on {CONFIG.dataset} NonIID Baseline"
 print(f"---------{program}----------")              # this is to identify the program in the slurm outputs files
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using device:", device)
-if device.type == "cuda":
-    print("CUDA available:", torch.cuda.is_available())
-    print("GPU Name:", torch.cuda.get_device_name(0))
-    print("GPU Capability OK!")
-else:
-    print("WARNING: Not running on GPU")
-
-
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # To print in color -------test/train of the client side
 def prRed(skk): print("\033[91m {}\033[00m" .format(skk)) 
 def prGreen(skk): print("\033[92m {}\033[00m" .format(skk))     
 
+def sync_cuda():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
 #===================================================================
-# No. of users
-num_users = 10
-epochs = 50
-frac = 1        # participation of clients; if 1 then 100% clients participate in SFLV1
-lr = 0.0001
+# ============================================================
+# Experiment parameters from config.py
+# ============================================================
+
+num_users = CONFIG.num_users
+epochs = CONFIG.global_rounds
+frac = CONFIG.frac
+lr = CONFIG.learning_rate
+alpha = CONFIG.alpha
+batch_size = CONFIG.batch_size
+local_epochs = CONFIG.local_epochs
+n_clusters = CONFIG.n_clusters
 
 
 #=====================================================================================================
@@ -77,7 +82,7 @@ class ResNet18_client_side(nn.Module):
     def __init__(self):
         super(ResNet18_client_side, self).__init__()
         self.layer1 = nn.Sequential (
-                nn.Conv2d(3, 64, kernel_size = 7, stride = 2, padding = 3, bias = False),
+                nn.Conv2d(CONFIG.input_channels, 64, kernel_size = 7, stride = 2, padding = 3, bias = False),
                 nn.BatchNorm2d(64),
                 nn.ReLU (inplace = True),
                 nn.MaxPool2d(kernel_size = 3, stride = 2, padding =1),
@@ -109,7 +114,10 @@ class ResNet18_client_side(nn.Module):
  
            
 
-net_glob_client = ResNet18_client_side()
+if CONFIG.model == "resnet18":
+    net_glob_client = ResNet18_client_side()
+else:
+    net_glob_client, _charlstm_server = build_charlstm(CONFIG)
 if torch.cuda.device_count() > 1:
     print("We use",torch.cuda.device_count(), "GPUs")
     net_glob_client = nn.DataParallel(net_glob_client)    
@@ -187,20 +195,25 @@ class ResNet18_server_side(nn.Module):
         return nn.Sequential(*netLayers)
         
     
-    def forward(self, x3):
+    def forward(self, x):
+        out2 = self.layer3(x)
+        out2 = out2 + x          # adding the resudial inputs -- downsampling not required in this layer
+        x3 = F.relu(out2)
         
-        x3 = self.layer3(x3)
-        x4 = self.layer4(x3)
+        x4 = self. layer4(x3)
         x5 = self.layer5(x4)
         x6 = self.layer6(x5)
         
-        x7 = self.averagePool(x6)            
-        x8 = torch.flatten(x7, 1)            
-        y_hat = self.fc(x8)
+        x7 = self.averagePool(x6)
+        x8 = torch.flatten(x7, 1)
+        y_hat =self.fc(x8)
         
         return y_hat
 
-net_glob_server = ResNet18_server_side(Baseblock, [2,2,2], 7) #7 is my numbr of classes
+if CONFIG.model == "resnet18":
+    net_glob_server = ResNet18_server_side(Baseblock, [2,2,2], CONFIG.num_classes)
+else:
+    net_glob_server = _charlstm_server
 if torch.cuda.device_count() > 1:
     print("We use",torch.cuda.device_count(), "GPUs")
     net_glob_server = nn.DataParallel(net_glob_server)   # to use the multiple GPUs 
@@ -214,6 +227,10 @@ loss_train_collect = []
 acc_train_collect = []
 loss_test_collect = []
 acc_test_collect = []
+
+global_acc_test_collect = []
+global_loss_test_collect = []
+
 batch_acc_train = []
 batch_loss_train = []
 batch_acc_test = []
@@ -453,27 +470,10 @@ class Client(object):
         self.idx = idx
         self.device = device
         self.lr = lr
-        self.local_ep = 1
+        self.local_ep = CONFIG.local_epochs
         #self.selected_clients = []
-        self.ldr_train = DataLoader(
-        DatasetSplit(dataset_train, idxs),
-        batch_size=128,
-        shuffle=True,
-        num_workers=8,
-        pin_memory=True,
-        persistent_workers=True
-        )
-        self.ldr_test = DataLoader(
-        DatasetSplit(dataset_test, idxs_test),
-        batch_size=128,
-        shuffle=False,
-        num_workers=8,
-        pin_memory=True,
-        persistent_workers=True
-    )
-        
-
-        # self.ldr_test = DataLoader(DatasetSplit(dataset_test, idxs_test), batch_size = 256, shuffle = True)
+        self.ldr_train = DataLoader(DatasetSplit(dataset_train, idxs), batch_size=CONFIG.batch_size, shuffle = True)
+        self.ldr_test = DataLoader(DatasetSplit(dataset_test, idxs_test), batch_size=CONFIG.batch_size, shuffle = True)
         
 
     def train(self, net):
@@ -488,18 +488,6 @@ class Client(object):
                 #---------forward prop-------------
                 fx = net(images)
                 client_fx = fx.clone().detach().requires_grad_(True)
-                # --- Save smashed features for EMD analysis ---
-                with torch.no_grad():
-                    _fx = fx.detach().cpu()
-                    _fx = _fx.view(_fx.size(0), -1)  # flatten spatial dims
-                    _take = min(256, _fx.size(0))
-                    _idx = torch.randperm(_fx.size(0))[:_take]
-                    outdir = f"smashed/client_{self.idx}"
-                    os.makedirs(outdir, exist_ok=True)
-                    torch.save(_fx[_idx], f"{outdir}/round_{iter}.pt")
-
-                # --- End save ---
-
                 
                 # Sending activations to server and receiving gradients from server
                 dfx = train_server(client_fx, labels, iter, self.local_ep, self.idx, len_batch)
@@ -532,39 +520,44 @@ class Client(object):
 #=====================================================================================================
 # dataset_iid() will create a dictionary to collect the indices of the data samples randomly for each client
 # IID HAM10000 datasets will be created based on this
-# def dataset_iid(dataset, num_users):
-    
-#     num_items = int(len(dataset)/num_users)
-#     dict_users, all_idxs = {}, [i for i in range(len(dataset))]
-#     for i in range(num_users):
-#         dict_users[i] = set(np.random.choice(all_idxs, num_items, replace = False))
-#         all_idxs = list(set(all_idxs) - dict_users[i])
-#     return dict_users    
-
 def dataset_noniid_dirichlet(
     labels,
     num_users,
-    alpha=0.1,
+    alpha,
     seed=42,
-    min_samples_per_client=1
+    min_samples_per_client=10,
+    max_attempts=1000
 ):
     labels = np.asarray(labels, dtype=np.int64)
-    num_classes = len(np.unique(labels))
+    class_ids = np.unique(labels)
     rng = np.random.default_rng(seed)
 
-    while True:
-        dict_users = {user_id: [] for user_id in range(num_users)}
+    for attempt in range(max_attempts):
 
-        for class_id in range(num_classes):
-            class_indices = np.where(labels == class_id)[0]
+        dict_users = {
+            user_id: []
+            for user_id in range(num_users)
+        }
+
+        for class_id in class_ids:
+
+            class_indices = np.where(
+                labels == class_id
+            )[0]
+
             rng.shuffle(class_indices)
 
             proportions = rng.dirichlet(
-                np.full(num_users, alpha, dtype=np.float64)
+                np.full(
+                    num_users,
+                    alpha,
+                    dtype=np.float64
+                )
             )
 
             split_points = (
-                np.cumsum(proportions)[:-1] * len(class_indices)
+                np.cumsum(proportions)[:-1]
+                * len(class_indices)
             ).astype(int)
 
             class_splits = np.split(
@@ -585,149 +578,131 @@ def dataset_noniid_dirichlet(
         if min(client_sizes) >= min_samples_per_client:
             break
 
+    else:
+        raise RuntimeError(
+            "Unable to create a valid Non-IID partition "
+            f"after {max_attempts} attempts."
+        )
+
     for user_id in range(num_users):
         rng.shuffle(dict_users[user_id])
-        dict_users[user_id] = set(dict_users[user_id])
+        dict_users[user_id] = set(
+            dict_users[user_id]
+        )
 
-    return dict_users
+    return dict_users  
+
+
+# ============================================================
+# Global evaluation for fair comparison with proposed methods
+# ============================================================
+
+def evaluate_global_model(
+    global_client_model,
+    global_server_model,
+    dataset_test
+):
+    test_loader = DataLoader(
+        dataset_test,
+        batch_size=CONFIG.batch_size,
+        shuffle=False
+    )
+
+    criterion_eval = nn.CrossEntropyLoss()
+
+    global_client_model.eval()
+    global_server_model.eval()
+
+    total_correct = 0
+    total_samples = 0
+    total_loss = 0.0
+
+    with torch.no_grad():
+
+        for images, labels in test_loader:
+
+            images = images.to(device)
+            labels = labels.to(device)
+
+            # Client-side part of SplitFed model
+            smashed = global_client_model(images)
+
+            # Server-side part of SplitFed model
+            outputs = global_server_model(smashed)
+
+            loss = criterion_eval(
+                outputs,
+                labels
+            )
+
+            predictions = outputs.argmax(
+                dim=1
+            )
+
+            total_correct += (
+                predictions == labels
+            ).sum().item()
+
+            total_samples += labels.size(0)
+
+            total_loss += (
+                loss.item()
+                * labels.size(0)
+            )
+
+    accuracy = (
+        100.0
+        * total_correct
+        / total_samples
+    )
+
+    average_loss = (
+        total_loss
+        / total_samples
+    )
+
+    return accuracy, average_loss
                           
-#=============================================================================
-#                         Data loading 
-#============================================================================= 
-df = pd.read_csv('data/HAM10000/HAM10000_metadata.csv')
-print(df.head())
+dataset_train, dataset_test, train_labels, test_labels = load_configured_datasets(CONFIG)
 
+print(f"{CONFIG.dataset} training samples:", len(dataset_train))
+print(f"{CONFIG.dataset} testing samples:", len(dataset_test))
 
-lesion_type = {
-    'nv': 'Melanocytic nevi',
-    'mel': 'Melanoma',
-    'bkl': 'Benign keratosis-like lesions ',
-    'bcc': 'Basal cell carcinoma',
-    'akiec': 'Actinic keratoses',
-    'vasc': 'Vascular lesions',
-    'df': 'Dermatofibroma'
-}
-
-# merging both folders of HAM1000 dataset -- part1 and part2 -- into a single directory
-# Correct image directory on Nova cluster
-image_dir = "data/HAM10000/HAM10000_images"
-
-imageid_path = {
-    os.path.splitext(os.path.basename(x))[0]: x
-    for x in glob(os.path.join(image_dir, '*.jpg'))
-}
-
-
-
-#print("path---------------------------------------", imageid_path.get)
-df['path'] = df['image_id'].map(imageid_path.get)
-df['cell_type'] = df['dx'].map(lesion_type.get)
-df['target'] = pd.Categorical(df['cell_type']).codes
-print(df['cell_type'].value_counts())
-print(df['target'].value_counts())
-
-#==============================================================
-# Custom dataset prepration in Pytorch format
-class SkinData(Dataset):
-    def __init__(self, df, transform = None):
-        
-        self.df = df
-        self.transform = transform
-        
-    def __len__(self):
-        
-        return len(self.df)
-    
-    def __getitem__(self, index):
-        
-        X = Image.open(self.df['path'][index]).resize((64, 64))
-        y = torch.tensor(int(self.df['target'][index]))
-        
-        if self.transform:
-            X = self.transform(X)
-        
-        return X, y
-#=============================================================================
-# Train-test split 
-
-train_full, test = train_test_split(
-    df,
-    test_size=0.20,
-    random_state=SEED,
-    stratify=df["dx"]
+print(
+    "Training class counts:",
+    np.bincount(
+        train_labels,
+        minlength=CONFIG.num_classes
+    ).tolist()
 )
 
-train, _ = train_test_split(
-    train_full,
-    train_size=0.20,
-    random_state=SEED,
-    stratify=train_full["dx"]
+print(
+    "Testing class counts:",
+    np.bincount(
+        test_labels,
+        minlength=CONFIG.num_classes
+    ).tolist()
 )
-
-train = train.reset_index(drop=True)
-test = test.reset_index(drop=True)
-
-print("Full dataset:", len(df))
-print("Training subset (20% of train):", len(train))
-print("Test set:", len(test))
-
-# train, test = train_test_split(
-#     df,
-#     test_size=0.2,
-#     random_state=SEED,
-#     stratify=df["dx"]
-# )
-
-# # Use only 20% of TRAIN data
-# train = train.sample(frac=0.20, random_state=SEED).reset_index(drop=True)
-# print("Train size:", len(train), "Test size:", len(test))         
-# # train, test = train_test_split(df, test_size = 0.2)
-
-# train = train.reset_index()
-# test = test.reset_index()
 
 #=============================================================================
-#                         Data preprocessing
-#=============================================================================  
-# Data preprocessing: Transformation 
-mean = [0.485, 0.456, 0.406]
-std = [0.229, 0.224, 0.225]
-
-train_transforms = transforms.Compose([transforms.RandomHorizontalFlip(), 
-                        transforms.RandomVerticalFlip(),
-                        transforms.Pad(3),
-                        transforms.RandomRotation(10),
-                        transforms.CenterCrop(64),
-                        transforms.ToTensor(), 
-                        transforms.Normalize(mean = mean, std = std)
-                        ])
-    
-test_transforms = transforms.Compose([
-                        transforms.Pad(3),
-                        transforms.CenterCrop(64),
-                        transforms.ToTensor(), 
-                        transforms.Normalize(mean = mean, std = std)
-                        ])    
+#                         Non-IID Partition
+#=============================================================================
 
 
-# With augmentation
-dataset_train = SkinData(train, transform = train_transforms)
-dataset_test = SkinData(test, transform = test_transforms)
-
-#----------------------------------------------------------------
-alpha = 0.1
-
-train_labels = train["target"].to_numpy(
-    dtype=np.int64
-)
 
 dict_users = dataset_noniid_dirichlet(
     labels=train_labels,
     num_users=num_users,
     alpha=alpha,
     seed=SEED,
-    min_samples_per_client=1
+    min_samples_per_client=10
 )
+
+# Keep the original test-partition idea:
+# create one test subset for every client.
+#
+# But because you asked for Non-IID TRAINING data while comparing models,
+# use the same complete test set for every client.
 all_test_indices = set(
     range(len(dataset_test))
 )
@@ -737,46 +712,63 @@ dict_users_test = {
     for user_id in range(num_users)
 }
 
-valid_users = [
-    user_id
-    for user_id in range(num_users)
-    if len(dict_users[user_id]) > 0
-]
-
 print(
-    f"Using HAM10000 Non-IID training split: "
-    f"alpha={alpha}, seed={SEED}"
+    f"\n{CONFIG.dataset} Non-IID partition | "
+    f"alpha={alpha} | "
+    f"seed={SEED}"
 )
 
-print("Valid clients:", len(valid_users))
 print(
-    "Identical test samples per client:",
-    len(all_test_indices)
+    "\n========== Client Training Distributions =========="
 )
 
+for user_id in range(num_users):
 
+    client_indices = sorted(
+        dict_users[user_id]
+    )
+
+    client_labels = train_labels[
+        client_indices
+    ]
+
+    class_counts = np.bincount(
+        client_labels,
+        minlength=CONFIG.num_classes
+    )
+
+    print(
+        f"Client {user_id} | "
+        f"samples={len(client_indices)} | "
+        f"class counts={class_counts.tolist()}"
+    )
 #------------ Training And Testing  -----------------
 net_glob_client.train()
 #copy weights
 w_glob_client = net_glob_client.state_dict()
+
+# ============================================================
+# TIMING SETUP
+# ============================================================
+
+round_times = []
+cumulative_times = []
+
+sync_cuda()
+experiment_start_time = time.perf_counter()
 # Federation takes place after certain local epochs in train() client-side
 # this epoch is global epoch, also known as rounds
 for iter in range(epochs):
-    m = min(
-        max(int(frac * num_users), 1),
-        len(valid_users)
+
+    sync_cuda()
+    round_start_time = time.perf_counter()
+
+    print(
+        f"\n========== Global Round {iter + 1}/{epochs} =========="
     )
-    if m == len(valid_users):
-        idxs_users = np.array(
-            sorted(valid_users),
-            dtype=np.int64
-        )
-    else:
-        idxs_users = np.random.choice(
-            valid_users,
-            m,
-            replace=False
-        )
+    
+    m = max(int(frac * num_users), 1)
+    idxs_users = np.random.choice(range(num_users), m, replace = False)
     w_locals_client = []
       
     for idx in idxs_users:
@@ -798,16 +790,119 @@ for iter in range(epochs):
     
     # Update client-side global model 
     net_glob_client.load_state_dict(w_glob_client)    
+
+
+    # ============================================================
+    # Evaluate final aggregated global SplitFed model
+    # ============================================================
+    
+    round_global_test_accuracy, round_global_test_loss = (
+        evaluate_global_model(
+            net_glob_client,
+            net_glob_server,
+            dataset_test
+        )
+    )
+
+    global_acc_test_collect.append(
+        round_global_test_accuracy
+    )
+
+    global_loss_test_collect.append(
+        round_global_test_loss
+    )
+
+    print(
+        f"Global Model Test => "
+        f"Round {iter + 1:3d} | "
+        f"Accuracy: {round_global_test_accuracy:.3f}% | "
+        f"Loss: {round_global_test_loss:.4f}"
+    )
+
+    # ========================================================
+    # ROUND TIMING
+    # ========================================================
+
+    sync_cuda()
+    round_end_time = time.perf_counter()
+
+    round_elapsed = round_end_time - round_start_time
+    cumulative_elapsed = round_end_time - experiment_start_time
+
+    round_times.append(round_elapsed)
+    cumulative_times.append(cumulative_elapsed)
+
+    print("\n---------------- TIMING ----------------")
+    print(
+        f"Round {iter + 1:3d} time: "
+        f"{round_elapsed:.2f} sec "
+        f"({round_elapsed / 60:.2f} min)"
+    )
+
+    print(
+        f"Cumulative time after round {iter + 1:3d}: "
+        f"{cumulative_elapsed:.2f} sec "
+        f"({cumulative_elapsed / 60:.2f} min)"
+    )
+    print("----------------------------------------")
     
 #===================================================================================     
+
+sync_cuda()
+experiment_end_time = time.perf_counter()
+
+total_experiment_time = (
+    experiment_end_time - experiment_start_time
+)
+
+print("\n==========================================================")
+print("              BASELINE TIMING SUMMARY")
+print("==========================================================")
+
+print(
+    f"Total time: {total_experiment_time:.2f} sec"
+)
+
+print(
+    f"Total time: {total_experiment_time / 60:.2f} min"
+)
+
+print(
+    f"Total time: {total_experiment_time / 3600:.2f} hours"
+)
+
+print(
+    f"Average round time: {np.mean(round_times):.2f} sec"
+)
+
+print("==========================================================")
 
 print("Training and Evaluation completed!")    
 
 #===============================================================================
 # Save output data to .excel file (we use for comparision plots)
 round_process = [i for i in range(1, len(acc_train_collect)+1)]
-df = DataFrame({'round': round_process,'acc_train':acc_train_collect, 'acc_test':acc_test_collect})     
-file_name = program+".xlsx"    
+df = DataFrame({
+    "round": round_process,
+
+    # Original repository-style SplitFedV1 metrics
+    "acc_train": acc_train_collect,
+    "original_acc_test": acc_test_collect,
+
+    # Common global evaluation metric for comparison
+    "global_acc_test": global_acc_test_collect,
+    "global_loss_test": global_loss_test_collect,
+
+    # Timing
+    "round_time_sec": round_times,
+    "cumulative_time_sec": cumulative_times
+})     
+file_name = (
+    f"{program}_"
+    f"alpha{CONFIG.alpha}_"
+    f"clients{CONFIG.num_users}_"
+    f"seed{CONFIG.seed}.xlsx"
+)
 df.to_excel(file_name, sheet_name= "v1_test", index = False)     
 
 #=============================================================================
