@@ -1,24 +1,32 @@
-# system
-.DS_Store
+__pycache__/
+*.pyc
 
 # environments
 curvfed_env/
 
-# python
-__pycache__/
-*.pyc
-*.pyo
-
-# generated data / outputs
+# datasets
 data/
+HAM10000/
+MNIST/
+
+# training artifacts
 smashed/
 distrib/
-logs/
-checkpoints/
 
+# model weights
+*.pt
+*.pth
+
+# logs
+*.txt
 *.log
-*.xlsx
+logs/
+
+# result files
 *.npy
+*.xlsx
 *.json
 *.png
-*.pth
+
+# Mac / system files
+.DS_Store
