@@ -14,10 +14,10 @@ ModelName = Literal["resnet18", "charlstm"]
 # ACTIVE EXPERIMENT — CHANGE ONLY THESE VALUES
 # =====================================================================
 
-DATASET: DatasetName = "shakespeare"
-MODEL: ModelName = "charlstm"
+DATASET: DatasetName = "cifar10"
+MODEL: ModelName = "resnet18"
 NUM_USERS = 100                 # 10 or 100
-ALPHA = 0.5                    # 999999, 0.1, 0.5, or 1.0
+ALPHA = 999999                    # 999999, 0.1, 0.5, or 1.0
 
 SEED = 42
 GLOBAL_ROUNDS = 50
