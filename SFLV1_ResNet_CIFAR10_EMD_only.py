@@ -356,8 +356,11 @@ def build_distrib_for_round(smashed_dir, distrib_dir):
 
 def compute_emd_for_round(distrib_dir, out_dir):
     files = sorted(glob(os.path.join(distrib_dir, "client*.pt")))
-    if len(files) != num_users:
-        raise RuntimeError(f"Expected {num_users} client distribution files, found {len(files)} in {distrib_dir}")
+    if len(files) != CONFIG.num_active_clients:
+        raise RuntimeError(
+            f"Expected {CONFIG.num_active_clients} active-client distribution "
+            f"files, found {len(files)} in {distrib_dir}"
+        )
     Xs = []
 
     for f in files:
@@ -400,10 +403,11 @@ def cluster_clients_from_emd(
     """
 
     # Safety checks
-    if emd.shape != (num_users, num_users):
+    expected_clients = CONFIG.num_active_clients
+    if emd.shape != (expected_clients, expected_clients):
         raise RuntimeError(
             f"Expected EMD matrix shape "
-            f"({num_users}, {num_users}), "
+            f"({expected_clients}, {expected_clients}), "
             f"found {emd.shape}"
         )
 
@@ -728,7 +732,7 @@ def train_server(fx_client, y, l_epoch_count, l_epoch, idx, len_batch):
                 #print(idx_collect)
         
         # This is for federation process--------------------
-        if len(idx_collect) == num_users:
+        if len(idx_collect) == CONFIG.num_active_clients:
         
         # All clients have completed training for this global round.
         # Do NOT perform FedAvg here.
@@ -777,13 +781,15 @@ class Client(object):
         self.lr = lr
         self.local_ep = CONFIG.local_epochs
         #self.selected_clients = []
+        client_batch_size = min(CONFIG.batch_size, len(idxs))
         self.ldr_train = DataLoader(
-        DatasetSplit(dataset_train, idxs),
-        batch_size=CONFIG.batch_size,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True,
-        persistent_workers=True
+            DatasetSplit(dataset_train, idxs),
+            batch_size=client_batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=4,
+            pin_memory=True,
+            persistent_workers=True,
         )
     #     self.ldr_test = DataLoader(
     #     DatasetSplit(dataset_test, idxs_test),
@@ -1164,9 +1170,11 @@ for global_round in range(epochs):
 
     smashed_dir, out_dir, distrib_dir = make_round_dirs(global_round)
     
-    m = min(
-        max(int(frac * num_users), 1),
-        len(valid_users)
+    m = CONFIG.num_active_clients
+    if m > len(valid_users):
+        raise ValueError(
+            f"Requested {m} active clients, but only "
+            f"{len(valid_users)} valid clients are available."
         )
     if m == len(valid_users):
         idxs_users = np.array(sorted(valid_users), dtype=np.int64)
@@ -1264,6 +1272,17 @@ for global_round in range(epochs):
         out_dir,
         n_clusters=CONFIG.n_clusters
     )
+
+    # Clustering labels index matrix rows; translate them back to the
+    # actual participating client IDs used in this round.
+    matrix_client_ids = [
+        int(os.path.splitext(os.path.basename(path))[0].replace("client", ""))
+        for path in distribution_files
+    ]
+    cluster_groups = {
+        cluster_id: [matrix_client_ids[position] for position in positions]
+        for cluster_id, positions in cluster_groups.items()
+    }
 
     print(
         f"Round {global_round + 1} cluster groups:",

@@ -383,7 +383,7 @@ def build_distrib_for_round(smashed_dir, distrib_dir):
             y = None
 
         if x.dim() > 2:
-            x = x.reshape(x.size(0), -1)
+            x = x.view(x.size(0), -1)
 
         client_batches.setdefault(client_id, []).append((x, y))
 
@@ -919,7 +919,7 @@ def train_server(fx_client, y, l_epoch_count, l_epoch, idx, len_batch):
                 #print(idx_collect)
         
         # This is for federation process--------------------
-        if len(idx_collect) == num_users:
+        if len(idx_collect) == CONFIG.num_active_clients:
         
         # All clients have completed training for this global round.
         # Do NOT perform FedAvg here.
@@ -968,13 +968,15 @@ class Client(object):
         self.lr = lr
         self.local_ep = CONFIG.local_epochs
         #self.selected_clients = []
+        client_batch_size = min(CONFIG.batch_size, len(idxs))
         self.ldr_train = DataLoader(
-        DatasetSplit(dataset_train, idxs),
-        batch_size=CONFIG.batch_size,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True,
-        persistent_workers=True
+            DatasetSplit(dataset_train, idxs),
+            batch_size=client_batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=4,
+            pin_memory=True,
+            persistent_workers=True,
         )
     #     self.ldr_test = DataLoader(
     #     DatasetSplit(dataset_test, idxs_test),
@@ -1001,14 +1003,12 @@ class Client(object):
                 #---------forward prop-------------
                 fx = net(images)
                 client_fx = fx.clone().detach().requires_grad_(True)
-                # Save paired smashed features and labels for EMD/FedOTDD.
                 # Save paired smashed features and labels for EMD/FedWaD.
                 with torch.no_grad():
                     _fx = fx.detach().cpu()
                     _labels = labels.detach().cpu().long()
 
                     if CONFIG.model == "charlstm":
-                        # Final LSTM hidden representation: [batch, hidden_size]
                         _fx = _fx[:, -1, :]
                     else:
                         if _fx.dim() > 2:
@@ -1029,10 +1029,7 @@ class Client(object):
                     if smashed_dir is not None and should_save:
                         os.makedirs(smashed_dir, exist_ok=True)
                         torch.save(
-                            {
-                                "features": _fx,
-                                "labels": _labels
-                            },
+                            {"features": _fx, "labels": _labels},
                             os.path.join(
                                 smashed_dir,
                                 f"client_{self.idx}_batch_{batch_idx}.pt"
@@ -1368,9 +1365,12 @@ for global_round in range(epochs):
 
     smashed_dir, out_dir, distrib_dir = make_round_dirs(global_round)
     
-    m = min(
-        max(int(frac * num_users), 1),
-        len(valid_users)
+    m = CONFIG.num_active_clients
+
+    if m > len(valid_users):
+        raise ValueError(
+            f"Requested {m} active clients, but only "
+            f"{len(valid_users)} valid clients are available."
         )
     if m == len(valid_users):
         idxs_users = np.array(sorted(valid_users), dtype=np.int64)

@@ -32,7 +32,11 @@ import numpy as np
 import os
 import time
 from config import CONFIG
-from experiment_support import build_charlstm, load_configured_datasets
+from experiment_support import (
+    build_charlstm,
+    load_configured_datasets,
+    natural_client_indices,
+)
 
 
 import matplotlib
@@ -59,7 +63,7 @@ torch.backends.cudnn.benchmark = False
   
 
 #===================================================================
-program = f"SFLV1 {CONFIG.model} on {CONFIG.dataset} NonIID EMD Only"
+program = f"SFLV1 {CONFIG.model} on {CONFIG.dataset} NonIID EMD ORC Weighted"
 print(f"---------{program}----------")              # this is to identify the program in the slurm outputs files
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -75,7 +79,7 @@ else:
 
 # To print in color -------test/train of the client side
 def prRed(skk): print("\033[91m {}\033[00m" .format(skk)) 
-def prGreen(skk): print("\033[92m {}\033[00m" .format(skk))     
+def prGreen(skk): print("\033[92m {}\033[00m" .format(skk))
 
 def sync_cuda():
     if torch.cuda.is_available():
@@ -273,13 +277,63 @@ def FedAvg(w):
         w_avg[k] = torch.div(w_avg[k], len(w))
     return w_avg
 
+def WeightedFedAvg(models, coefficients):
+    """
+    Weighted aggregation of model state_dicts.
+
+    models:
+        List of state_dicts.
+
+    coefficients:
+        Weight assigned to each model.
+        They will automatically be normalized.
+    """
+
+    if len(models) != len(coefficients):
+        raise ValueError(
+            "Number of models and coefficients must match."
+        )
+
+    coefficients = np.asarray(
+        coefficients,
+        dtype=np.float64
+    )
+
+    coefficients = (
+        coefficients / coefficients.sum()
+    )
+
+    w_avg = copy.deepcopy(models[0])
+
+    for key in w_avg.keys():
+
+        # BatchNorm's num_batches_tracked is integer-valued.
+        if not torch.is_floating_point(w_avg[key]):
+            w_avg[key] = copy.deepcopy(
+                models[0][key]
+            )
+            continue
+
+        w_avg[key] = (
+            models[0][key]
+            * float(coefficients[0])
+        )
+
+        for i in range(1, len(models)):
+            w_avg[key] += (
+                models[i][key]
+                * float(coefficients[i])
+            )
+
+    return w_avg
+
 def make_round_dirs(global_round):
     round_name = f"round_{global_round + 1:03d}"
 
     experiment_root = (
         f"{CONFIG.dataset}_{CONFIG.model}_"
-        f"emd_only_"
-        f"alpha{CONFIG.alpha}_"
+        f"emd_orc_weighted_"
+        f"{CONFIG.partition_name}_"
         f"seed{CONFIG.seed}_"
         f"clients{CONFIG.num_users}"
     )
@@ -355,12 +409,16 @@ def build_distrib_for_round(smashed_dir, distrib_dir):
 
 
 def compute_emd_for_round(distrib_dir, out_dir):
-    files = sorted(glob(os.path.join(distrib_dir, "client*.pt")))
-    if len(files) != CONFIG.num_active_clients:
-        raise RuntimeError(
-            f"Expected {CONFIG.num_active_clients} active-client distribution "
-            f"files, found {len(files)} in {distrib_dir}"
-        )
+    def client_id_from_path(path):
+        return int(os.path.basename(path).replace("client", "").replace(".pt", ""))
+
+    files = sorted(
+        glob(os.path.join(distrib_dir, "client*.pt")),
+        key=client_id_from_path,
+    )
+    if not files:
+        raise RuntimeError(f"No client distribution files found in {distrib_dir}")
+    client_ids = [client_id_from_path(path) for path in files]
     Xs = []
 
     for f in files:
@@ -385,125 +443,7 @@ def compute_emd_for_round(distrib_dir, out_dir):
         for row in emd:
             f.write(" ".join([f"{v:.4f}" for v in row]) + "\n")
 
-    return emd
-
-
-def cluster_clients_from_emd(
-    emd,
-    out_dir,
-    n_clusters=CONFIG.n_clusters
-):
-    """
-    Cluster clients directly from the pairwise EMD distance matrix.
-
-    This is the EMD-only experiment:
-        EMD -> Agglomerative Clustering
-
-    No Ollivier-Ricci Curvature is used.
-    """
-
-    # Safety checks
-    expected_clients = CONFIG.num_active_clients
-    if emd.shape != (expected_clients, expected_clients):
-        raise RuntimeError(
-            f"Expected EMD matrix shape "
-            f"({expected_clients}, {expected_clients}), "
-            f"found {emd.shape}"
-        )
-
-    if not np.allclose(
-        emd,
-        emd.T,
-        atol=1e-8
-    ):
-        raise RuntimeError(
-            "EMD matrix is not symmetric."
-        )
-
-    if not np.allclose(
-        np.diag(emd),
-        0.0,
-        atol=1e-8
-    ):
-        raise RuntimeError(
-            "EMD matrix diagonal must be zero."
-        )
-
-    # Agglomerative clustering accepts the EMD
-    # matrix directly as a precomputed distance matrix.
-    try:
-        model = AgglomerativeClustering(
-            n_clusters=n_clusters,
-            metric="precomputed",
-            linkage="average"
-        )
-    except TypeError:
-        # Compatibility with older sklearn
-        model = AgglomerativeClustering(
-            n_clusters=n_clusters,
-            affinity="precomputed",
-            linkage="average"
-        )
-
-    labels = model.fit_predict(
-        emd
-    )
-
-    cluster_groups = {}
-
-    for client_id, cluster_id in enumerate(
-        labels
-    ):
-        cluster_groups.setdefault(
-            int(cluster_id),
-            []
-        ).append(
-            client_id
-        )
-
-    # Save readable cluster information
-    with open(
-        os.path.join(
-            out_dir,
-            "cluster_summary.txt"
-        ),
-        "w"
-    ) as f:
-
-        f.write(
-            "EMD-only client clustering\n\n"
-        )
-
-        for client_id, cluster_id in enumerate(
-            labels
-        ):
-            f.write(
-                f"Client {client_id} -> "
-                f"Cluster {cluster_id}\n"
-            )
-
-        f.write(
-            "\nCluster groups\n"
-        )
-
-        for cluster_id, clients in sorted(
-            cluster_groups.items()
-        ):
-            f.write(
-                f"Cluster {cluster_id}: "
-                f"{clients}\n"
-            )
-
-    np.savetxt(
-        os.path.join(
-            out_dir,
-            "client_clusters.txt"
-        ),
-        labels,
-        fmt="%d"
-    )
-
-    return labels, cluster_groups
+    return emd, client_ids
 
 
 def compute_ricci_for_round(emd, out_dir):
@@ -522,9 +462,9 @@ def compute_ricci_for_round(emd, out_dir):
         nbrs = np.argsort(sim[i])[::-1][:k]
         for j in nbrs:
             if i != j:
-                G.add_edge(i, j, weight=float(sim[i, j]), distance=float(emd[i, j]))
+                G.add_edge(i, j, weight=float(emd[i, j]))
 
-    ricci = OllivierRicci(G, alpha=0.5, method="OTD", verbose="ERROR")
+    ricci = OllivierRicci(G, weight="weight", alpha=0.5, method="OTD", verbose="ERROR")
     Gk = ricci.compute_ricci_curvature()
 
     edge_kappa = {}
@@ -536,71 +476,175 @@ def compute_ricci_for_round(emd, out_dir):
     return Gk
 
 
-def cluster_clients_from_ricci(Gk, out_dir, n_clusters=CONFIG.n_clusters):
+def cluster_clients_from_ricci(
+    Gk,
+    client_ids,
+    out_dir,
+    n_clusters=CONFIG.n_clusters
+):
     n = Gk.number_of_nodes()
 
-    ricci_distance = np.ones((n, n), dtype=np.float64)
+    if len(client_ids) != n:
+        raise RuntimeError(
+            f"Expected {n} client IDs for the Ricci graph, found {len(client_ids)}."
+        )
 
-    np.fill_diagonal(ricci_distance, 0.0)
+    # ============================================================
+    # Convert Ricci curvature on each graph edge to edge distance
+    # ============================================================
 
     for u, v, data in Gk.edges(data=True):
-        curvature = float(data.get("ricciCurvature", 0.0))
 
-        # Higher curvature = stronger structural similarity.
-        # Convert it to a non-negative distance.
-        distance = max(0.0, 1.0 - curvature)
+        curvature = float(
+            data.get(
+                "ricciCurvature",
+                0.0
+            )
+        )
 
-        ricci_distance[u, v] = distance
-        ricci_distance[v, u] = distance
+        # Higher curvature = closer relationship
+        # Lower curvature = larger distance
+        edge_distance = max(
+            1e-8,
+            1.0 - curvature
+        )
+
+        Gk[u][v]["ricci_distance"] = (
+            edge_distance
+        )
+
+    # ============================================================
+    # Build complete client-to-client Ricci distance matrix
+    # using shortest paths through the graph
+    # ============================================================
+
+    ricci_distance = np.full(
+        (n, n),
+        np.inf,
+        dtype=np.float64
+    )
+
+    np.fill_diagonal(
+        ricci_distance,
+        0.0
+    )
+
+    all_pairs = dict(
+        nx.all_pairs_dijkstra_path_length(
+            Gk,
+            weight="ricci_distance"
+        )
+    )
+
+    for source in range(n):
+
+        for target, distance in all_pairs[
+            source
+        ].items():
+
+            ricci_distance[
+                source,
+                target
+            ] = float(distance)
+
+    # ============================================================
+    # Safety check
+    # ============================================================
+
+    if not np.all(
+        np.isfinite(
+            ricci_distance
+        )
+    ):
+        raise RuntimeError(
+            "Ricci graph is disconnected. "
+            "Increase the kNN neighborhood size."
+        )
+
+    # ============================================================
+    # Agglomerative clustering
+    # ============================================================
 
     try:
+
         model = AgglomerativeClustering(
             n_clusters=n_clusters,
             metric="precomputed",
             linkage="average"
         )
+
     except TypeError:
+
         model = AgglomerativeClustering(
             n_clusters=n_clusters,
             affinity="precomputed",
             linkage="average"
         )
 
-    labels = model.fit_predict(ricci_distance)
+    labels = model.fit_predict(
+        ricci_distance
+    )
 
     cluster_groups = {}
 
-    for client_id, cluster_id in enumerate(labels):
+    for client_id, cluster_id in zip(client_ids, labels):
+
         cluster_groups.setdefault(
             int(cluster_id),
             []
-        ).append(client_id)
+        ).append(
+            client_id
+        )
+
+    # ============================================================
+    # Save results
+    # ============================================================
+
+    np.save(
+        os.path.join(
+            out_dir,
+            "ricci_distance_matrix.npy"
+        ),
+        ricci_distance
+    )
 
     with open(
-        os.path.join(out_dir, "cluster_summary.txt"),
+        os.path.join(
+            out_dir,
+            "cluster_summary.txt"
+        ),
         "w"
     ) as f:
 
-        f.write("Ricci-based client clustering\n\n")
+        f.write(
+            "Ricci-based client clustering\n\n"
+        )
 
-        for client_id, cluster_id in enumerate(labels):
+        for client_id, cluster_id in zip(client_ids, labels):
+
             f.write(
                 f"Client {client_id} -> "
                 f"Cluster {cluster_id}\n"
             )
 
-        f.write("\nCluster groups\n")
+        f.write(
+            "\nCluster groups\n"
+        )
 
         for cluster_id, clients in sorted(
             cluster_groups.items()
         ):
+
             f.write(
                 f"Cluster {cluster_id}: "
                 f"{clients}\n"
             )
 
     np.savetxt(
-        os.path.join(out_dir, "client_clusters.txt"),
+        os.path.join(
+            out_dir,
+            "client_clusters.txt"
+        ),
         labels,
         fmt="%d"
     )
@@ -608,24 +652,96 @@ def cluster_clients_from_ricci(Gk, out_dir, n_clusters=CONFIG.n_clusters):
     return labels, cluster_groups
 
 
-def clusterwise_fedavg(server_weights_by_id, cluster_groups):
+def clusterwise_fedavg(
+    server_weights_by_id,
+    cluster_groups,
+    dict_users
+):
     cluster_models = []
+    cluster_sample_counts = []
+    cluster_ids_order = []
 
-    for cluster_id, client_ids in sorted(cluster_groups.items()):
+    # =====================================================
+    # LEVEL 1:
+    # FedAvg normally inside every cluster
+    # =====================================================
+
+    for cluster_id, client_ids in sorted(
+        cluster_groups.items()
+    ):
 
         cluster_weights = [
             server_weights_by_id[client_id]
             for client_id in client_ids
         ]
 
-        cluster_model = FedAvg(cluster_weights)
-        cluster_models.append(cluster_model)
+        cluster_model = FedAvg(
+            cluster_weights
+        )
 
-    # Only after ALL clusters have been averaged
-    final_global_model = FedAvg(cluster_models)
+        cluster_models.append(
+            cluster_model
+        )
 
-    return final_global_model, cluster_models
+        cluster_ids_order.append(
+            cluster_id
+        )
 
+        # Total number of training samples represented
+        # by this cluster
+        cluster_samples = sum(
+            len(dict_users[client_id])
+            for client_id in client_ids
+        )
+
+        cluster_sample_counts.append(
+            cluster_samples
+        )
+
+    # =====================================================
+    # LEVEL 2:
+    # Weight cluster models according to amount of data
+    # =====================================================
+
+    total_samples = sum(
+        cluster_sample_counts
+    )
+
+    cluster_coefficients = [
+        count / total_samples
+        for count in cluster_sample_counts
+    ]
+
+    final_global_model = WeightedFedAvg(
+        cluster_models,
+        cluster_coefficients
+    )
+
+    # Print exactly what was used
+    print("\n----- Cluster aggregation weights -----")
+
+    for cluster_id, sample_count, coefficient in zip(
+        cluster_ids_order,
+        cluster_sample_counts,
+        cluster_coefficients
+    ):
+        print(
+            f"Cluster {cluster_id}: "
+            f"samples={sample_count}, "
+            f"weight={coefficient:.4f}"
+        )
+
+    print(
+        "Weight sum:",
+        sum(cluster_coefficients)
+    )
+
+    print("---------------------------------------")
+
+    return (
+        final_global_model,
+        cluster_models
+    )
 
 def calculate_accuracy(fx, y):
     preds = fx.max(1, keepdim=True)[1]
@@ -736,7 +852,7 @@ def train_server(fx_client, y, l_epoch_count, l_epoch, idx, len_batch):
         
         # All clients have completed training for this global round.
         # Do NOT perform FedAvg here.
-        # Aggregation will happen later after EMD-only clustering.
+        # Aggregation will happen later after EMD + ORC + clustering.
 
             acc_avg_all_user_train = (
                 sum(acc_train_collect_user) /
@@ -781,15 +897,13 @@ class Client(object):
         self.lr = lr
         self.local_ep = CONFIG.local_epochs
         #self.selected_clients = []
-        client_batch_size = min(CONFIG.batch_size, len(idxs))
         self.ldr_train = DataLoader(
-            DatasetSplit(dataset_train, idxs),
-            batch_size=client_batch_size,
-            shuffle=True,
-            drop_last=True,
-            num_workers=4,
-            pin_memory=True,
-            persistent_workers=True,
+        DatasetSplit(dataset_train, idxs),
+        batch_size=CONFIG.batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True
         )
     #     self.ldr_test = DataLoader(
     #     DatasetSplit(dataset_test, idxs_test),
@@ -839,7 +953,6 @@ class Client(object):
                                 f"client_{self.idx}_batch_{batch_idx}.pt"
                             )
                         )
-                    
 
                 # --- End save ---
 
@@ -1038,22 +1151,24 @@ print(
 
 
 
-dict_users = dataset_noniid_dirichlet(
-    labels=train_labels,
-    num_users=num_users,
-    alpha=alpha,
-    seed=SEED,
-    min_samples_per_client=10,
-    max_attempts=1000
-)
-
-# Identical complete test set for every client
-all_test_indices = set(range(len(dataset_test)))
-
-dict_users_test = {
-    user_id: all_test_indices.copy()
-    for user_id in range(num_users)
-}
+if CONFIG.uses_natural_partition:
+    dict_users, dict_users_test = natural_client_indices(dataset_train, dataset_test)
+    print(f"\nUsing {CONFIG.num_users} natural LEAF Shakespeare clients | seed={SEED}")
+else:
+    dict_users = dataset_noniid_dirichlet(
+        labels=train_labels,
+        num_users=num_users,
+        alpha=alpha,
+        seed=SEED,
+        min_samples_per_client=10,
+        max_attempts=1000,
+    )
+    all_test_indices = set(range(len(dataset_test)))
+    dict_users_test = {
+        user_id: all_test_indices.copy()
+        for user_id in range(num_users)
+    }
+    print(f"\nUsing {CONFIG.dataset} Dirichlet partition | alpha={alpha} | seed={SEED}")
 
 valid_users = [
     user_id
@@ -1061,17 +1176,7 @@ valid_users = [
     if len(dict_users[user_id]) > 0
 ]
 
-print(
-    f"\nUsing complete {CONFIG.dataset} dataset with "
-    f"Dirichlet Non-IID partition: "
-    f"alpha={alpha}, seed={SEED}"
-)
-
 print("Valid clients:", valid_users)
-print(
-    "Identical test samples per client:",
-    len(all_test_indices)
-)
 
 print(
     "\n========== Non-IID client distributions =========="
@@ -1139,10 +1244,6 @@ assert set(all_assigned_indices) == set(range(len(dataset_train))), (
 net_glob_client.train()
 #copy weights
 w_glob_client = net_glob_client.state_dict()
-
-# ============================================================
-# TIMING SETUP
-# ============================================================
 
 round_times = []
 cumulative_times = []
@@ -1231,7 +1332,7 @@ for global_round in range(epochs):
         # # )
 
     print("-----------------------------------------------------------")
-    print("------ Round-wise EMD Only + Cluster FedAvg --------------")
+    print("------ Round-wise EMD + ORC + Cluster FedAvg -------------")
     print("-----------------------------------------------------------")  
     
     # 1. Build one smashed-data distribution per client
@@ -1257,30 +1358,31 @@ for global_round in range(epochs):
         )
 
     # 2. Calculate pairwise EMD
-    emd = compute_emd_for_round(
+    emd, distance_client_ids = compute_emd_for_round(
         distrib_dir,
         out_dir
     )
 
-    # 3. EMD-ONLY clustering
-    # Directly use the EMD distance matrix.
-    # No Ollivier-Ricci Curvature is calculated.
-    labels, cluster_groups = cluster_clients_from_emd(
+    expected_ids = sorted(int(client_id) for client_id in idxs_users)
+    if distance_client_ids != expected_ids:
+        raise RuntimeError(
+            "Distance client IDs do not match selected clients: "
+            f"{distance_client_ids} vs {expected_ids}"
+        )
+
+    # 3. Build client similarity graph + calculate ORC
+    ricci_graph = compute_ricci_for_round(
         emd,
+        out_dir
+    )
+
+    # 4. Use Ricci/graph structure to create clusters
+    labels, cluster_groups = cluster_clients_from_ricci(
+        ricci_graph,
+        distance_client_ids,
         out_dir,
         n_clusters=CONFIG.n_clusters
     )
-
-    # Clustering labels index matrix rows; translate them back to the
-    # actual participating client IDs used in this round.
-    matrix_client_ids = [
-        int(os.path.splitext(os.path.basename(path))[0].replace("client", ""))
-        for path in distribution_files
-    ]
-    cluster_groups = {
-        cluster_id: [matrix_client_ids[position] for position in positions]
-        for cluster_id, positions in cluster_groups.items()
-    }
 
     print(
         f"Round {global_round + 1} cluster groups:",
@@ -1310,7 +1412,8 @@ for global_round in range(epochs):
 
     w_glob_server, cluster_models_server = clusterwise_fedavg(
         server_weights_by_id,
-        cluster_groups
+        cluster_groups,
+        dict_users
     )
 
     # Update global server model
@@ -1411,13 +1514,9 @@ for global_round in range(epochs):
         f"({cumulative_elapsed / 60:.2f} min)"
     )
     print("----------------------------------------")
-
-
 #===================================================================================     
 
-# ============================================================
-# TOTAL EXPERIMENT TIMING
-# ============================================================
+print("Training and Evaluation completed!")    
 
 sync_cuda()
 experiment_end_time = time.perf_counter()
@@ -1427,32 +1526,13 @@ total_experiment_time = (
 )
 
 print("\n==========================================================")
-print("              EMD ONLY TIMING SUMMARY")
+print("       EMD + ORC WEIGHTED TIMING SUMMARY")
 print("==========================================================")
-
-print(
-    f"Total time: "
-    f"{total_experiment_time:.2f} sec"
-)
-
-print(
-    f"Total time: "
-    f"{total_experiment_time / 60:.2f} min"
-)
-
-print(
-    f"Total time: "
-    f"{total_experiment_time / 3600:.2f} hours"
-)
-
-print(
-    f"Average round time: "
-    f"{np.mean(round_times):.2f} sec"
-)
-
+print(f"Total time: {total_experiment_time:.2f} sec")
+print(f"Total time: {total_experiment_time / 60:.2f} min")
+print(f"Total time: {total_experiment_time / 3600:.2f} hours")
+print(f"Average round time: {np.mean(round_times):.2f} sec")
 print("==========================================================")
-
-print("Training and Evaluation completed!") 
 
 #===============================================================================
 # Save output data to .excel file (we use for comparision plots)
@@ -1468,12 +1548,7 @@ assert len(acc_train_collect) == epochs, (
 )
 round_process = list(range(1, epochs + 1))
 df = DataFrame({'round': round_process,'acc_train':acc_train_collect, 'acc_test':acc_test_collect, 'round_time_sec':round_times, 'cumulative_time_sec':cumulative_times})     
-file_name = (
-    f"{program}_"
-    f"alpha{CONFIG.alpha}_"
-    f"clients{CONFIG.num_users}_"
-    f"seed{CONFIG.seed}.xlsx"
-) 
+file_name = f"{program.replace(' ', '_')}_{CONFIG.experiment_tag}.xlsx"
 df.to_excel(file_name, sheet_name= "v1_test", index = False)     
 
 #=============================================================================

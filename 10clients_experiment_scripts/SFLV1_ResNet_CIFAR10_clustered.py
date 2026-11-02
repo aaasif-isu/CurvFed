@@ -34,7 +34,6 @@ import time
 from config import CONFIG
 from experiment_support import build_charlstm, load_configured_datasets
 
-
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -59,7 +58,7 @@ torch.backends.cudnn.benchmark = False
   
 
 #===================================================================
-program = f"SFLV1 {CONFIG.model} on {CONFIG.dataset} NonIID EMD ORC Weighted"
+program = f"SFLV1 {CONFIG.model} on {CONFIG.dataset} NonIID EMD ORC"
 print(f"---------{program}----------")              # this is to identify the program in the slurm outputs files
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -75,7 +74,7 @@ else:
 
 # To print in color -------test/train of the client side
 def prRed(skk): print("\033[91m {}\033[00m" .format(skk)) 
-def prGreen(skk): print("\033[92m {}\033[00m" .format(skk))
+def prGreen(skk): print("\033[92m {}\033[00m" .format(skk))     
 
 def sync_cuda():
     if torch.cuda.is_available():
@@ -273,62 +272,12 @@ def FedAvg(w):
         w_avg[k] = torch.div(w_avg[k], len(w))
     return w_avg
 
-def WeightedFedAvg(models, coefficients):
-    """
-    Weighted aggregation of model state_dicts.
-
-    models:
-        List of state_dicts.
-
-    coefficients:
-        Weight assigned to each model.
-        They will automatically be normalized.
-    """
-
-    if len(models) != len(coefficients):
-        raise ValueError(
-            "Number of models and coefficients must match."
-        )
-
-    coefficients = np.asarray(
-        coefficients,
-        dtype=np.float64
-    )
-
-    coefficients = (
-        coefficients / coefficients.sum()
-    )
-
-    w_avg = copy.deepcopy(models[0])
-
-    for key in w_avg.keys():
-
-        # BatchNorm's num_batches_tracked is integer-valued.
-        if not torch.is_floating_point(w_avg[key]):
-            w_avg[key] = copy.deepcopy(
-                models[0][key]
-            )
-            continue
-
-        w_avg[key] = (
-            models[0][key]
-            * float(coefficients[0])
-        )
-
-        for i in range(1, len(models)):
-            w_avg[key] += (
-                models[i][key]
-                * float(coefficients[i])
-            )
-
-    return w_avg
-
 def make_round_dirs(global_round):
     round_name = f"round_{global_round + 1:03d}"
 
     experiment_root = (
         f"{CONFIG.dataset}_{CONFIG.model}_"
-        f"emd_orc_weighted_"
+        f"emd_orc_"
         f"alpha{CONFIG.alpha}_"
         f"seed{CONFIG.seed}_"
         f"clients{CONFIG.num_users}"
@@ -406,11 +355,8 @@ def build_distrib_for_round(smashed_dir, distrib_dir):
 
 def compute_emd_for_round(distrib_dir, out_dir):
     files = sorted(glob(os.path.join(distrib_dir, "client*.pt")))
-    if len(files) != CONFIG.num_active_clients:
-        raise RuntimeError(
-            f"Expected {CONFIG.num_active_clients} active-client distribution "
-            f"files, found {len(files)} in {distrib_dir}"
-        )
+    if len(files) != num_users:
+        raise RuntimeError(f"Expected {num_users} client distribution files, found {len(files)} in {distrib_dir}")
     Xs = []
 
     for f in files:
@@ -642,96 +588,24 @@ def cluster_clients_from_ricci(
     return labels, cluster_groups
 
 
-def clusterwise_fedavg(
-    server_weights_by_id,
-    cluster_groups,
-    dict_users
-):
+def clusterwise_fedavg(server_weights_by_id, cluster_groups):
     cluster_models = []
-    cluster_sample_counts = []
-    cluster_ids_order = []
 
-    # =====================================================
-    # LEVEL 1:
-    # FedAvg normally inside every cluster
-    # =====================================================
-
-    for cluster_id, client_ids in sorted(
-        cluster_groups.items()
-    ):
+    for cluster_id, client_ids in sorted(cluster_groups.items()):
 
         cluster_weights = [
             server_weights_by_id[client_id]
             for client_id in client_ids
         ]
 
-        cluster_model = FedAvg(
-            cluster_weights
-        )
+        cluster_model = FedAvg(cluster_weights)
+        cluster_models.append(cluster_model)
 
-        cluster_models.append(
-            cluster_model
-        )
+    # Only after ALL clusters have been averaged
+    final_global_model = FedAvg(cluster_models)
 
-        cluster_ids_order.append(
-            cluster_id
-        )
+    return final_global_model, cluster_models
 
-        # Total number of training samples represented
-        # by this cluster
-        cluster_samples = sum(
-            len(dict_users[client_id])
-            for client_id in client_ids
-        )
-
-        cluster_sample_counts.append(
-            cluster_samples
-        )
-
-    # =====================================================
-    # LEVEL 2:
-    # Weight cluster models according to amount of data
-    # =====================================================
-
-    total_samples = sum(
-        cluster_sample_counts
-    )
-
-    cluster_coefficients = [
-        count / total_samples
-        for count in cluster_sample_counts
-    ]
-
-    final_global_model = WeightedFedAvg(
-        cluster_models,
-        cluster_coefficients
-    )
-
-    # Print exactly what was used
-    print("\n----- Cluster aggregation weights -----")
-
-    for cluster_id, sample_count, coefficient in zip(
-        cluster_ids_order,
-        cluster_sample_counts,
-        cluster_coefficients
-    ):
-        print(
-            f"Cluster {cluster_id}: "
-            f"samples={sample_count}, "
-            f"weight={coefficient:.4f}"
-        )
-
-    print(
-        "Weight sum:",
-        sum(cluster_coefficients)
-    )
-
-    print("---------------------------------------")
-
-    return (
-        final_global_model,
-        cluster_models
-    )
 
 def calculate_accuracy(fx, y):
     preds = fx.max(1, keepdim=True)[1]
@@ -838,7 +712,7 @@ def train_server(fx_client, y, l_epoch_count, l_epoch, idx, len_batch):
                 #print(idx_collect)
         
         # This is for federation process--------------------
-        if len(idx_collect) == CONFIG.num_active_clients:
+        if len(idx_collect) == num_users:
         
         # All clients have completed training for this global round.
         # Do NOT perform FedAvg here.
@@ -887,15 +761,13 @@ class Client(object):
         self.lr = lr
         self.local_ep = CONFIG.local_epochs
         #self.selected_clients = []
-        client_batch_size = min(CONFIG.batch_size, len(idxs))
         self.ldr_train = DataLoader(
-            DatasetSplit(dataset_train, idxs),
-            batch_size=client_batch_size,
-            shuffle=True,
-            drop_last=True,
-            num_workers=4,
-            pin_memory=True,
-            persistent_workers=True,
+        DatasetSplit(dataset_train, idxs),
+        batch_size=CONFIG.batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True
         )
     #     self.ldr_test = DataLoader(
     #     DatasetSplit(dataset_test, idxs_test),
@@ -905,10 +777,9 @@ class Client(object):
     #     pin_memory=True,
     #     persistent_workers=True
     # )
-        
 
-    
-        
+
+
 
     def train(self, net, smashed_dir=None):
         net.train()
@@ -1376,16 +1247,6 @@ for global_round in range(epochs):
         n_clusters=CONFIG.n_clusters
     )
 
-    # Translate matrix-row positions back to actual participating client IDs.
-    matrix_client_ids = [
-        int(os.path.splitext(os.path.basename(path))[0].replace("client", ""))
-        for path in distribution_files
-    ]
-    cluster_groups = {
-        cluster_id: [matrix_client_ids[position] for position in positions]
-        for cluster_id, positions in cluster_groups.items()
-    }
-
     print(
         f"Round {global_round + 1} cluster groups:",
         cluster_groups
@@ -1414,8 +1275,7 @@ for global_round in range(epochs):
 
     w_glob_server, cluster_models_server = clusterwise_fedavg(
         server_weights_by_id,
-        cluster_groups,
-        dict_users
+        cluster_groups
     )
 
     # Update global server model
@@ -1509,7 +1369,6 @@ for global_round in range(epochs):
         f"{round_elapsed:.2f} sec "
         f"({round_elapsed / 60:.2f} min)"
     )
-
     print(
         f"Cumulative time after round {global_round + 1:3d}: "
         f"{cumulative_elapsed:.2f} sec "
@@ -1517,9 +1376,6 @@ for global_round in range(epochs):
     )
     print("----------------------------------------")
 #===================================================================================     
-
-print("Training and Evaluation completed!")    
-
 sync_cuda()
 experiment_end_time = time.perf_counter()
 
@@ -1528,13 +1384,15 @@ total_experiment_time = (
 )
 
 print("\n==========================================================")
-print("       EMD + ORC WEIGHTED TIMING SUMMARY")
+print("             EMD + ORC TIMING SUMMARY")
 print("==========================================================")
 print(f"Total time: {total_experiment_time:.2f} sec")
 print(f"Total time: {total_experiment_time / 60:.2f} min")
 print(f"Total time: {total_experiment_time / 3600:.2f} hours")
 print(f"Average round time: {np.mean(round_times):.2f} sec")
 print("==========================================================")
+
+print("Training and Evaluation completed!")    
 
 #===============================================================================
 # Save output data to .excel file (we use for comparision plots)
@@ -1555,7 +1413,7 @@ file_name = (
     f"alpha{CONFIG.alpha}_"
     f"clients{CONFIG.num_users}_"
     f"seed{CONFIG.seed}.xlsx"
-) 
+)
 df.to_excel(file_name, sheet_name= "v1_test", index = False)     
 
 #=============================================================================

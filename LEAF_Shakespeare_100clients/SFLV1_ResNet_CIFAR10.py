@@ -27,7 +27,11 @@ import numpy as np
 import os
 import time
 from config import CONFIG
-from experiment_support import build_charlstm, load_configured_datasets
+from experiment_support import (
+    build_charlstm,
+    load_configured_datasets,
+    natural_client_indices,
+)
 
 
 import matplotlib
@@ -472,14 +476,7 @@ class Client(object):
         self.lr = lr
         self.local_ep = CONFIG.local_epochs
         #self.selected_clients = []
-        client_batch_size = min(CONFIG.batch_size, len(idxs))
-
-        self.ldr_train = DataLoader(
-            DatasetSplit(dataset_train, idxs),
-            batch_size=client_batch_size,
-            shuffle=True,
-            drop_last=True,
-        )
+        self.ldr_train = DataLoader(DatasetSplit(dataset_train, idxs), batch_size=CONFIG.batch_size, shuffle = True)
         self.ldr_test = DataLoader(DatasetSplit(dataset_test, idxs_test), batch_size=CONFIG.batch_size, shuffle = True)
         
 
@@ -697,33 +694,32 @@ print(
 
 
 
-dict_users = dataset_noniid_dirichlet(
-    labels=train_labels,
-    num_users=num_users,
-    alpha=alpha,
-    seed=SEED,
-    min_samples_per_client=10
-)
-
-# Keep the original test-partition idea:
-# create one test subset for every client.
-#
-# But because you asked for Non-IID TRAINING data while comparing models,
-# use the same complete test set for every client.
-all_test_indices = set(
-    range(len(dataset_test))
-)
-
-dict_users_test = {
-    user_id: all_test_indices.copy()
-    for user_id in range(num_users)
-}
-
-print(
-    f"\n{CONFIG.dataset} Non-IID partition | "
-    f"alpha={alpha} | "
-    f"seed={SEED}"
-)
+if CONFIG.uses_natural_partition:
+    dict_users, dict_users_test = natural_client_indices(
+        dataset_train,
+        dataset_test,
+    )
+    print(
+        f"\nUsing {CONFIG.num_users} natural LEAF Shakespeare clients | "
+        f"seed={SEED}"
+    )
+else:
+    dict_users = dataset_noniid_dirichlet(
+        labels=train_labels,
+        num_users=num_users,
+        alpha=alpha,
+        seed=SEED,
+        min_samples_per_client=10,
+    )
+    all_test_indices = set(range(len(dataset_test)))
+    dict_users_test = {
+        user_id: all_test_indices.copy()
+        for user_id in range(num_users)
+    }
+    print(
+        f"\nUsing {CONFIG.dataset} Dirichlet partition | "
+        f"alpha={alpha} | seed={SEED}"
+    )
 
 print(
     "\n========== Client Training Distributions =========="
@@ -906,12 +902,7 @@ df = DataFrame({
     "round_time_sec": round_times,
     "cumulative_time_sec": cumulative_times
 })     
-file_name = (
-    f"{program}_"
-    f"alpha{CONFIG.alpha}_"
-    f"clients{CONFIG.num_users}_"
-    f"seed{CONFIG.seed}.xlsx"
-)
+file_name = f"{program.replace(' ', '_')}_{CONFIG.experiment_tag}.xlsx"
 df.to_excel(file_name, sheet_name= "v1_test", index = False)     
 
 #=============================================================================

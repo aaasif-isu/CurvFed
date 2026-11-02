@@ -354,7 +354,7 @@ def train_server(fx_client, y, l_epoch_count, l_epoch, idx, len_batch):
                 #print(idx_collect)
         
         # This is for federation process--------------------
-        if len(idx_collect) == num_users:
+        if len(idx_collect) == CONFIG.num_active_clients:
             fed_check = True                                                  # to evaluate_server function  - to check fed check has hitted
             # Federation process at Server-Side------------------------- output print and update is done in evaluate_server()
             # for nicer display 
@@ -472,7 +472,14 @@ class Client(object):
         self.lr = lr
         self.local_ep = CONFIG.local_epochs
         #self.selected_clients = []
-        self.ldr_train = DataLoader(DatasetSplit(dataset_train, idxs), batch_size=CONFIG.batch_size, shuffle = True)
+        client_batch_size = min(CONFIG.batch_size, len(idxs))
+
+        self.ldr_train = DataLoader(
+            DatasetSplit(dataset_train, idxs),
+            batch_size=client_batch_size,
+            shuffle=True,
+            drop_last=True,
+        )
         self.ldr_test = DataLoader(DatasetSplit(dataset_test, idxs_test), batch_size=CONFIG.batch_size, shuffle = True)
         
 
@@ -767,8 +774,10 @@ for iter in range(epochs):
         f"\n========== Global Round {iter + 1}/{epochs} =========="
     )
     
-    m = max(int(frac * num_users), 1)
-    idxs_users = np.random.choice(range(num_users), m, replace = False)
+    m = CONFIG.num_active_clients
+    round_rng = np.random.default_rng(SEED + iter)
+    idxs_users = round_rng.choice(range(num_users), m, replace=False)
+    idxs_users = np.array(sorted(int(x) for x in idxs_users), dtype=np.int64)
     w_locals_client = []
       
     for idx in idxs_users:
