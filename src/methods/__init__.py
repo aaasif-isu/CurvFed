@@ -14,6 +14,7 @@ from .curvfed_agg import (
 )
 from .tca import (
     build_cost_matrix,
+    build_variance_vector,
     estimate_q,
     flatten_split_params,
     lazy_calibrate,
@@ -37,6 +38,7 @@ __all__ = [
     "compute_cluster_ari",
     "flatten_split_params",
     "estimate_q",
+    "build_variance_vector",
     "build_cost_matrix",
     "solve_tca_plan",
     "plan_curvature",

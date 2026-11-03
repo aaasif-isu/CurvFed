@@ -2,7 +2,7 @@ import os
 import torch
 from torch.utils.data import DataLoader
 from ..data.partition import DatasetSplit
-from ..methods.tca import flatten_split_params
+from .train_utils import flatten_split_params
 
 
 class Client:

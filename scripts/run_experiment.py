@@ -54,6 +54,7 @@ from src.methods.curvfed_agg import (
 )
 from src.methods.tca import (
     build_cost_matrix,
+    build_variance_vector,
     estimate_q,
     flatten_split_params,
     lazy_calibrate,
@@ -385,22 +386,27 @@ def run_experiment(
             w_glob_server = FedAvg(w_locals_server)
             w_glob_client = FedAvg(w_locals_client)
         elif method == "tca":
-            v_vec = np.asarray(active_sample_counts, dtype=np.float64)
-            v_vec = v_vec / max(float(v_vec.sum()), 1e-12)
-            C_mat = build_cost_matrix(config.tca_cost, deltas=active_deltas, emd_matrix=emd)
-            A_plan = solve_tca_plan(C_mat, v_vec, marginal=config.tca_marginal, reg=config.tca_reg)
-            curv_stats = plan_curvature(A_plan, C_mat, v=v_vec)
+            sample_weights = np.asarray(active_sample_counts, dtype=np.float64)
+            sample_weights = sample_weights / max(float(sample_weights.sum()), 1e-12)
+            v_vec = build_variance_vector(active_sample_counts, var_scale=config.tca_var_scale)
+            D_mat = build_cost_matrix(config.tca_cost, deltas=active_deltas, emd_matrix=emd)
+            A_plan = solve_tca_plan(
+                D_mat,
+                v_vec,
+                marginal=config.tca_marginal,
+                tau=config.tca_tau,
+            )
+            curv_stats = plan_curvature(A_plan, D_mat)
 
             if config.tca_calibrate:
                 A_plan, beta_val, _ = lazy_calibrate(
                     A_plan,
                     median_q=median_q,
                     kappa_target=config.tca_kappa_target,
-                    C=C_mat,
-                    v=v_vec,
+                    D=D_mat,
                     curv_stats=curv_stats,
                 )
-                curv_stats = plan_curvature(A_plan, C_mat, v=v_vec)
+                curv_stats = plan_curvature(A_plan, D_mat)
 
             kappa_min = float(curv_stats["kappa_min"])
             kappa_mean = float(curv_stats["kappa_mean"])
@@ -418,7 +424,7 @@ def run_experiment(
                 w_locals_client,
                 w_locals_server,
                 A_plan,
-                v_vec,
+                sample_weights,
                 [int(u) for u in active_users],
             )
             for cid_int in [int(u) for u in active_users]:
@@ -634,10 +640,12 @@ def main():
     parser.add_argument("--consistent-split-weights", type=int, default=None, choices=[0, 1])
     parser.add_argument("--tca-mode", type=str, default=None, choices=["decoupled", "feedback"])
     parser.add_argument("--tca-cost", type=str, default=None, choices=["update", "emd"])
-    parser.add_argument("--tca-marginal", type=str, default=None, choices=["hard", "none"])
+    parser.add_argument("--tca-marginal", type=str, default=None, choices=["hard", "unbalanced", "none"])
     parser.add_argument("--tca-calibrate", type=int, default=None, choices=[0, 1])
     parser.add_argument("--tca-kappa-target", type=str, default=None)
-    parser.add_argument("--tca-reg", type=float, default=None)
+    parser.add_argument("--tca-var-scale", type=float, default=None)
+    parser.add_argument("--tca-tau", type=float, default=None)
+    parser.add_argument("--tca-reg", type=float, default=None, help="Deprecated alias for --tca-var-scale.")
     parser.add_argument("--dataset", type=str, default=None, choices=["cifar10", "mnist", "shakespeare"])
     parser.add_argument("--model", type=str, default=None, choices=["resnet18", "smallcnn", "charlstm"])
     parser.add_argument("--num-users", type=int, default=None)
@@ -682,7 +690,11 @@ def main():
         kt_str = args.tca_kappa_target.strip().lower()
         overrides["tca_kappa_target"] = "auto" if kt_str == "auto" else float(kt_str)
     if args.tca_reg is not None:
-        overrides["tca_reg"] = float(args.tca_reg)
+        overrides["tca_var_scale"] = float(args.tca_reg)
+    if args.tca_var_scale is not None:
+        overrides["tca_var_scale"] = float(args.tca_var_scale)
+    if args.tca_tau is not None:
+        overrides["tca_tau"] = float(args.tca_tau)
     if args.dataset is not None:
         overrides["dataset"] = args.dataset
     if args.model is not None:

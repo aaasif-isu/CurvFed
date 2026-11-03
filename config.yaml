@@ -67,10 +67,11 @@ run_noise_floor: true              # true: run Sanity Check A (within- vs cross-
 tca:
   mode: "decoupled"         # "decoupled" (start from global model) or "feedback" (start from personalized model)
   cost: "update"            # "update" (pairwise delta L2 distance) or "emd" (smashed activation EMD)
-  marginal: "hard"          # "hard" (doubly constrained: A 1 = 1 and v^T A = v^T) or "none" (row-only: A 1 = 1)
+  marginal: "hard"          # "hard" (doubly stochastic), "unbalanced" (KL rel_entr with tau), or "none" (row-only)
   calibrate: false          # true: apply lazy_calibrate(A, median_q, kappa_target) before aggregating
   kappa_target: "auto"      # "auto" (= mean kappa of uncalibrated plan) or a float number (e.g. 0.25)
-  reg: 1.0                  # Quadratic regularization weight for solving A
+  var_scale: 1.0            # Per-client variance weight scale: v_k = var_scale * mean(n) / n_k
+  tau: 1.0                  # Unbalanced column marginal KL penalty weight (used when marginal: "unbalanced")
 
 # ---------------------------------------------------------------------
 # 6. Output & Logging Settings

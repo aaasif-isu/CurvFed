@@ -3,6 +3,20 @@ import numpy as np
 import torch
 
 
+def flatten_split_params(
+    client_net: torch.nn.Module, server_net: torch.nn.Module
+) -> np.ndarray:
+    """Flatten trainable floating-point parameters of both client-half and server-half models."""
+    vecs = []
+    for module in (client_net, server_net):
+        for p in module.parameters():
+            if p.is_floating_point():
+                vecs.append(p.detach().cpu().reshape(-1).to(dtype=torch.float64).numpy())
+    if not vecs:
+        return np.zeros(1, dtype=np.float64)
+    return np.concatenate(vecs, axis=0)
+
+
 def FedAvg(w):
     w_avg = copy.deepcopy(w[0])
     for k in w_avg.keys():

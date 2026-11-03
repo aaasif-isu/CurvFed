@@ -66,10 +66,12 @@ ZSCORE_MODE = os.getenv("ZSCORE_MODE", "per_client").strip().lower()   # "per_cl
 # Phase-2 TCA controls
 TCA_MODE = os.getenv("TCA_MODE", "decoupled").strip().lower()          # "decoupled" or "feedback"
 TCA_COST = os.getenv("TCA_COST", "update").strip().lower()             # "update" or "emd"
-TCA_MARGINAL = os.getenv("TCA_MARGINAL", "hard").strip().lower()       # "hard" or "none"
+TCA_MARGINAL = os.getenv("TCA_MARGINAL", "hard").strip().lower()       # "hard", "unbalanced", or "none"
 TCA_CALIBRATE = os.getenv("TCA_CALIBRATE", "0").strip().lower() in ("1", "true", "yes")
 TCA_KAPPA_TARGET: Union[str, float] = os.getenv("TCA_KAPPA_TARGET", "auto").strip()
-TCA_REG = float(os.getenv("TCA_REG", "1.0"))
+TCA_VAR_SCALE = float(os.getenv("TCA_VAR_SCALE", os.getenv("TCA_REG", "1.0")))
+TCA_TAU = float(os.getenv("TCA_TAU", "1.0"))
+TCA_REG = TCA_VAR_SCALE  # deprecated alias
 
 
 # =====================================================================
@@ -133,7 +135,12 @@ class ExperimentConfig:
     tca_marginal: str = TCA_MARGINAL
     tca_calibrate: bool = TCA_CALIBRATE
     tca_kappa_target: Union[str, float] = TCA_KAPPA_TARGET
-    tca_reg: float = TCA_REG
+    tca_var_scale: float = TCA_VAR_SCALE
+    tca_tau: float = TCA_TAU
+
+    @property
+    def tca_reg(self) -> float:
+        return self.tca_var_scale
 
     @property
     def num_active_clients(self) -> int:
@@ -228,10 +235,12 @@ def _validate(cfg: ExperimentConfig) -> None:
         raise ValueError("tca_mode must be 'decoupled' or 'feedback'.")
     if cfg.tca_cost not in ("update", "emd"):
         raise ValueError("tca_cost must be 'update' or 'emd'.")
-    if cfg.tca_marginal not in ("hard", "none"):
-        raise ValueError("tca_marginal must be 'hard' or 'none'.")
-    if cfg.tca_reg <= 0:
-        raise ValueError("tca_reg must be strictly positive.")
+    if cfg.tca_marginal not in ("hard", "unbalanced", "none"):
+        raise ValueError("tca_marginal must be 'hard', 'unbalanced', or 'none'.")
+    if cfg.tca_var_scale <= 0:
+        raise ValueError("tca_var_scale must be strictly positive.")
+    if cfg.tca_tau <= 0:
+        raise ValueError("tca_tau must be strictly positive.")
     if isinstance(cfg.tca_kappa_target, str):
         if cfg.tca_kappa_target.strip().lower() != "auto":
             try:
@@ -321,7 +330,10 @@ _YAML_KEY_ALIASES = {
     "tca.marginal": "tca_marginal",
     "tca.calibrate": "tca_calibrate",
     "tca.kappa_target": "tca_kappa_target",
-    "tca.reg": "tca_reg",
+    "tca.var_scale": "tca_var_scale",
+    "tca.reg": "tca_var_scale",
+    "tca_reg": "tca_var_scale",
+    "tca.tau": "tca_tau",
 }
 
 
@@ -383,7 +395,15 @@ def load_config_from_yaml(yaml_path: Union[str, os.PathLike] = DEFAULT_YAML_PATH
         if opt_int_key in normalized and normalized[opt_int_key] is not None:
             normalized[opt_int_key] = int(normalized[opt_int_key])
 
-    for float_key in ("alpha", "learning_rate", "frac", "fedwad_t", "shakespeare_train_fraction", "tca_reg"):
+    for float_key in (
+        "alpha",
+        "learning_rate",
+        "frac",
+        "fedwad_t",
+        "shakespeare_train_fraction",
+        "tca_var_scale",
+        "tca_tau",
+    ):
         if float_key in normalized and normalized[float_key] is not None:
             normalized[float_key] = float(normalized[float_key])
 
@@ -403,7 +423,8 @@ def load_config_from_yaml(yaml_path: Union[str, os.PathLike] = DEFAULT_YAML_PATH
             for k in (
                 "method", "cluster_mode", "zscore_mode", "consistent_split_weights",
                 "run_noise_floor", "output_dir", "save_excel", "seed",
-                "tca_mode", "tca_cost", "tca_marginal", "tca_calibrate", "tca_kappa_target", "tca_reg",
+                "tca_mode", "tca_cost", "tca_marginal", "tca_calibrate",
+                "tca_kappa_target", "tca_var_scale", "tca_tau",
             )
             if k in normalized
         }
@@ -425,7 +446,8 @@ def load_config_from_yaml(yaml_path: Union[str, os.PathLike] = DEFAULT_YAML_PATH
         consistent_split_weights=CONSISTENT_SPLIT_WEIGHTS, cluster_mode=CLUSTER_MODE,
         zscore_mode=ZSCORE_MODE,
         tca_mode=TCA_MODE, tca_cost=TCA_COST, tca_marginal=TCA_MARGINAL,
-        tca_calibrate=TCA_CALIBRATE, tca_kappa_target=TCA_KAPPA_TARGET, tca_reg=TCA_REG,
+        tca_calibrate=TCA_CALIBRATE, tca_kappa_target=TCA_KAPPA_TARGET,
+        tca_var_scale=TCA_VAR_SCALE, tca_tau=TCA_TAU,
     )
     cfg = replace(base_defaults, **normalized)
     _validate(cfg)

@@ -39,6 +39,8 @@ from configs.default_config import (
     TCA_MARGINAL,
     TCA_MODE,
     TCA_REG,
+    TCA_TAU,
+    TCA_VAR_SCALE,
     ZSCORE_MODE,
     DatasetName,
     ExperimentConfig,
