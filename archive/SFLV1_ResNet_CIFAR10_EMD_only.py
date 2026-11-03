@@ -663,9 +663,10 @@ def train_server(fx_client, y, l_epoch_count, l_epoch, idx, len_batch):
     global lr
     global server_weights_by_id
     
-    net_server = copy.deepcopy(net_model_server[idx]).to(device)
+    if count1 == 0 and l_epoch_count == 0:
+        net_server = copy.deepcopy(net_model_server[idx]).to(device)
+        optimizer_server = torch.optim.Adam(net_server.parameters(), lr = lr)
     net_server.train()
-    optimizer_server = torch.optim.Adam(net_server.parameters(), lr = lr)
 
     
     # train and update

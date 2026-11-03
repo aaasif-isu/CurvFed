@@ -278,9 +278,10 @@ def train_server(fx_client, y, l_epoch_count, l_epoch, idx, len_batch):
     global loss_train_collect, acc_train_collect, count1, acc_avg_all_user_train, loss_avg_all_user_train, idx_collect, w_locals_server, w_glob_server, net_server
     global loss_train_collect_user, acc_train_collect_user, lr
     
-    net_server = copy.deepcopy(net_model_server[idx]).to(device)
+    if count1 == 0 and l_epoch_count == 0:
+        net_server = copy.deepcopy(net_model_server[idx]).to(device)
+        optimizer_server = torch.optim.Adam(net_server.parameters(), lr = lr)
     net_server.train()
-    optimizer_server = torch.optim.Adam(net_server.parameters(), lr = lr)
 
     
     # train and update

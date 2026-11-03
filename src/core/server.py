@@ -11,6 +11,7 @@ def calculate_accuracy(fx, y):
 class Server:
     def __init__(self, models, device, lr, num_users, global_model=None):
         self.device = device
+        self.lr = lr
         self.models = {idx: copy.deepcopy(model).to(device) for idx, model in models.items()}
         self.global_model = (
             copy.deepcopy(global_model).to(device)
@@ -19,19 +20,25 @@ class Server:
         )
         self.optimizers = {idx: torch.optim.Adam(self.models[idx].parameters(), lr=lr) for idx in models}
         self.criterion = nn.CrossEntropyLoss()
-        
+
         self.batch_loss_train = []
         self.batch_acc_train = []
         self.batch_loss_test = []
         self.batch_acc_test = []
-        
+
         self.epoch_train_stats = {idx: {"acc": 0.0, "loss": 0.0} for idx in models}
         self.epoch_test_stats = {idx: {"acc": 0.0, "loss": 0.0} for idx in models}
-        
+
         self.count1 = 0
         self.count2 = 0
 
+    def reset_optimizer(self, idx: int) -> None:
+        """Create a fresh Adam optimizer for client `idx` at the start of its round training."""
+        self.optimizers[idx] = torch.optim.Adam(self.models[idx].parameters(), lr=self.lr)
+
     def train_step(self, fx_client, y, iter_local, local_ep, idx, len_batch):
+        if self.count1 == 0 and iter_local == 0:
+            self.reset_optimizer(idx)
         net = self.models[idx]
         optimizer = self.optimizers[idx]
         net.train()
