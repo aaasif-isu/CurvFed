@@ -14,6 +14,7 @@ import torch
 from GraphRicciCurvature.OllivierRicci import OllivierRicci
 from scipy.sparse.csgraph import floyd_warshall
 from sklearn.cluster import AgglomerativeClustering
+from sklearn.metrics import adjusted_rand_score
 
 
 def _client_id_from_path(path: str) -> int:
@@ -35,7 +36,13 @@ def make_round_dirs(global_round: int, experiment_root: str = "outputs_curvfed")
     return smashed_dir, out_dir, distrib_dir
 
 
-def build_distrib_for_round(smashed_dir: str, distrib_dir: str, seed: int = 42, cap: int = 256) -> List[int]:
+def build_distrib_for_round(
+    smashed_dir: str,
+    distrib_dir: str,
+    seed: int = 42,
+    cap: int = 256,
+    cleanup_smashed: bool = True,
+) -> List[int]:
     os.makedirs(distrib_dir, exist_ok=True)
     client_batches: Dict[int, List[torch.Tensor]] = {}
 
@@ -57,6 +64,9 @@ def build_distrib_for_round(smashed_dir: str, distrib_dir: str, seed: int = 42, 
             x_all = x_all[selected]
         torch.save(x_all, os.path.join(distrib_dir, f"client{client_id}.pt"))
 
+    if cleanup_smashed and os.path.exists(smashed_dir):
+        shutil.rmtree(smashed_dir, ignore_errors=True)
+
     return sorted(client_batches.keys())
 
 
@@ -65,15 +75,36 @@ def _standardize_cloud(X: np.ndarray) -> np.ndarray:
     return (X - X.mean(axis=0, keepdims=True)) / (X.std(axis=0, keepdims=True) + 1e-8)
 
 
-def compute_emd_for_round(distrib_dir: str, out_dir: Optional[str] = None) -> np.ndarray:
+def _normalize_client_clouds(
+    raw_clouds: List[np.ndarray], zscore_mode: str = "per_client"
+) -> List[np.ndarray]:
+    """Normalize client activation point clouds according to `zscore_mode` (Sanity Check C)."""
+    zscore_mode = zscore_mode.lower()
+    clouds = [np.asarray(X, dtype=np.float64) for X in raw_clouds]
+    if zscore_mode == "per_client":
+        return [_standardize_cloud(X) for X in clouds]
+    elif zscore_mode == "pooled":
+        pooled = np.concatenate(clouds, axis=0)
+        mean_pool = pooled.mean(axis=0, keepdims=True)
+        std_pool = pooled.std(axis=0, keepdims=True) + 1e-8
+        return [(X - mean_pool) / std_pool for X in clouds]
+    elif zscore_mode == "none":
+        return clouds
+    else:
+        raise ValueError(f"Unsupported zscore_mode: {zscore_mode}")
+
+
+def compute_emd_for_round(
+    distrib_dir: str,
+    out_dir: Optional[str] = None,
+    zscore_mode: str = "per_client",
+) -> np.ndarray:
     files = sorted(glob(os.path.join(distrib_dir, "client*.pt")), key=_client_id_from_path)
     if not files:
         raise RuntimeError(f"No client distribution files found in {distrib_dir}")
 
-    Xs = []
-    for f in files:
-        X = torch.load(f, map_location="cpu").float().numpy()
-        Xs.append(_standardize_cloud(X))
+    raw_clouds = [torch.load(f, map_location="cpu").float().numpy() for f in files]
+    Xs = _normalize_client_clouds(raw_clouds, zscore_mode=zscore_mode)
 
     k = len(Xs)
     emd = np.zeros((k, k), dtype=np.float64)
@@ -99,60 +130,75 @@ def compute_emd_noise_floor(
     distrib_dir: str,
     emd_matrix: Optional[np.ndarray] = None,
     seed: int = 42,
+    zscore_mode: str = "per_client",
 ) -> Dict[str, object]:
-    """Sanity Check A: Compare within-client (self-split) EMD vs cross-client EMD."""
+    """Sanity Check A (Fair Equal-Sample-Size):
+    Split each client i into disjoint halves A_i and B_i of the SAME sample size h;
+    compute within = EMD(A_i, B_i) and cross = EMD(A_i, A_j) for i < j."""
     files = sorted(glob(os.path.join(distrib_dir, "client*.pt")), key=_client_id_from_path)
     if not files:
         raise RuntimeError(f"No client distribution files found in {distrib_dir}")
 
     client_ids = [_client_id_from_path(f) for f in files]
-    Xs = []
+    raw_clouds = [torch.load(f, map_location="cpu").float().numpy() for f in files]
+    Xs = _normalize_client_clouds(raw_clouds, zscore_mode=zscore_mode)
+
+    half_sizes = [X.shape[0] // 2 for X in Xs]
+    common_half = min(half_sizes) if half_sizes else 0
+
+    halves_A: List[np.ndarray] = []
+    halves_B: List[np.ndarray] = []
     within_emds: Dict[int, float] = {}
 
-    for cid, f in zip(client_ids, files):
-        raw_X = torch.load(f, map_location="cpu").float().numpy()
-        X = _standardize_cloud(raw_X)
-        Xs.append(X)
-
-        n_samples = X.shape[0]
-        if n_samples < 2:
+    for cid, X in zip(client_ids, Xs):
+        if common_half < 1:
             within_emds[cid] = 0.0
+            halves_A.append(X)
+            halves_B.append(X)
             continue
         rng = np.random.default_rng(seed + int(cid) * 101)
-        perm = rng.permutation(n_samples)
-        half = n_samples // 2
-        X_a = X[perm[:half]]
-        X_b = X[perm[half : 2 * half]]
-        w_a, w_b = ot.unif(len(X_a)), ot.unif(len(X_b))
-        M_ab = ot.dist(X_a, X_b, metric="euclidean")
-        within_emds[cid] = float(ot.emd2(w_a, w_b, M_ab))
+        perm = rng.permutation(X.shape[0])
+        A_i = X[perm[:common_half]]
+        B_i = X[perm[common_half : 2 * common_half]]
+        halves_A.append(A_i)
+        halves_B.append(B_i)
 
-    if emd_matrix is None:
-        emd_matrix = compute_emd_for_round(distrib_dir, out_dir=None)
+        w_h = ot.unif(common_half)
+        M_ab = ot.dist(A_i, B_i, metric="euclidean")
+        within_emds[cid] = float(ot.emd2(w_h, w_h, M_ab))
 
-    k = len(Xs)
-    cross_vals = [float(emd_matrix[i, j]) for i in range(k) for j in range(i + 1, k)]
+    k = len(halves_A)
+    cross_vals: List[float] = []
+    if common_half >= 1:
+        w_h = ot.unif(common_half)
+        for i in range(k):
+            for j in range(i + 1, k):
+                M_ij = ot.dist(halves_A[i], halves_A[j], metric="euclidean")
+                cross_vals.append(float(ot.emd2(w_h, w_h, M_ij)))
+
     within_vals = list(within_emds.values())
-
     within_mean = float(np.mean(within_vals)) if within_vals else 0.0
     within_std = float(np.std(within_vals)) if within_vals else 0.0
     cross_mean = float(np.mean(cross_vals)) if cross_vals else 0.0
     cross_std = float(np.std(cross_vals)) if cross_vals else 0.0
     snr = cross_mean / max(within_mean, 1e-12)
 
-    print("---------------- SANITY CHECK A: EMD NOISE FLOOR ----------------")
     print(
-        f"  Within-client (self-split) EMD: mean={within_mean:.4f}, std={within_std:.4f}, "
+        f"---------------- SANITY CHECK A: EMD NOISE FLOOR (zscore={zscore_mode}, half_n={common_half}) ----------------"
+    )
+    print(
+        f"  Within-client EMD(A_i, B_i): mean={within_mean:.4f}, std={within_std:.4f}, "
         f"min={min(within_vals):.4f}, max={max(within_vals):.4f} | per-client={within_emds}"
     )
     print(
-        f"  Cross-client (pairwise)   EMD: mean={cross_mean:.4f}, std={cross_std:.4f}, "
+        f"  Cross-client  EMD(A_i, A_j): mean={cross_mean:.4f}, std={cross_std:.4f}, "
         f"min={min(cross_vals):.4f}, max={max(cross_vals):.4f}"
     )
     print(f"  EMD Signal-to-Noise Ratio (cross / within): {snr:.4f}x")
-    print("-----------------------------------------------------------------")
+    print("------------------------------------------------------------------------------------------------------")
 
     return {
+        "sample_size_half": common_half,
         "within_client_emd": within_emds,
         "within_mean": within_mean,
         "within_std": within_std,
@@ -352,5 +398,53 @@ def cluster_clients_from_emd(
         np.savetxt(os.path.join(out_dir, "client_clusters.txt"), labels, fmt="%d")
 
     return labels, cluster_groups
+
+
+def apply_cluster_mode(
+    cluster_groups: Dict[int, List[int]],
+    cluster_mode: str = "geometry",
+    seed: int = 42,
+) -> Dict[int, List[int]]:
+    """Sanity Check B: Either preserve geometric clusters ('geometry') or randomly permute
+    clients into clusters of the exact same sizes ('random')."""
+    cluster_mode = cluster_mode.lower()
+    if cluster_mode == "geometry":
+        return {int(k): [int(x) for x in v] for k, v in sorted(cluster_groups.items())}
+    if cluster_mode != "random":
+        raise ValueError(f"Unsupported cluster_mode: {cluster_mode}")
+
+    sorted_keys = sorted(cluster_groups.keys())
+    sizes = [len(cluster_groups[k]) for k in sorted_keys]
+    all_clients = sorted(int(cid) for k in sorted_keys for cid in cluster_groups[k])
+
+    rng = np.random.default_rng(seed)
+    shuffled = rng.permutation(all_clients).tolist()
+
+    random_groups: Dict[int, List[int]] = {}
+    cursor = 0
+    for k, sz in zip(sorted_keys, sizes):
+        random_groups[int(k)] = sorted(shuffled[cursor : cursor + sz])
+        cursor += sz
+    return random_groups
+
+
+def compute_cluster_ari(
+    prev_cluster_groups: Optional[Dict[int, List[int]]],
+    curr_cluster_groups: Optional[Dict[int, List[int]]],
+) -> float:
+    """Sanity Check D: Compute Adjusted Rand Index (ARI) between two clusterings over common clients."""
+    if not prev_cluster_groups or not curr_cluster_groups:
+        return float("nan")
+
+    prev_map = {int(cid): int(k) for k, cids in prev_cluster_groups.items() for cid in cids}
+    curr_map = {int(cid): int(k) for k, cids in curr_cluster_groups.items() for cid in cids}
+    common_clients = sorted(set(prev_map.keys()).intersection(curr_map.keys()))
+    if len(common_clients) < 2:
+        return float("nan")
+
+    prev_labels = [prev_map[cid] for cid in common_clients]
+    curr_labels = [curr_map[cid] for cid in common_clients]
+    return float(adjusted_rand_score(prev_labels, curr_labels))
+
 
 

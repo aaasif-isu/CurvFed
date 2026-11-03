@@ -6,7 +6,7 @@ curvfed_env/
 curvfed/
 
 # datasets
-data/
+/data/
 HAM10000/
 MNIST/
 

@@ -35,6 +35,11 @@ FEDWAD_EPOCHS = 20
 FEDWAD_T = 0.5
 DISTANCE_POOL_SIZE = 1
 
+# Phase-1 ablation & consistency controls
+CONSISTENT_SPLIT_WEIGHTS = os.getenv("CONSISTENT_SPLIT_WEIGHTS", "1").strip().lower() in ("1", "true", "yes")
+CLUSTER_MODE = os.getenv("CLUSTER_MODE", "geometry").strip().lower()   # "geometry" or "random"
+ZSCORE_MODE = os.getenv("ZSCORE_MODE", "per_client").strip().lower()   # "per_client", "pooled", or "none"
+
 
 # =====================================================================
 # FIXED DATASET / MODEL SETTINGS — NORMALLY DO NOT CHANGE
@@ -85,6 +90,9 @@ class ExperimentConfig:
     max_samples_per_client: Optional[int] = None
     max_test_samples: Optional[int] = None
     smoke_test: bool = False
+    consistent_split_weights: bool = CONSISTENT_SPLIT_WEIGHTS
+    cluster_mode: str = CLUSTER_MODE
+    zscore_mode: str = ZSCORE_MODE
 
     @property
     def num_active_clients(self) -> int:
@@ -152,6 +160,10 @@ def _validate(cfg: ExperimentConfig) -> None:
         raise ValueError("SHAKESPEARE_TRAIN_FRACTION must be between 0 and 1.")
     if cfg.max_samples_per_client is not None and cfg.max_samples_per_client <= 0:
         raise ValueError("max_samples_per_client must be positive when provided.")
+    if cfg.cluster_mode not in ("geometry", "random"):
+        raise ValueError("cluster_mode must be 'geometry' or 'random'.")
+    if cfg.zscore_mode not in ("per_client", "pooled", "none"):
+        raise ValueError("zscore_mode must be 'per_client', 'pooled', or 'none'.")
 
 
 def get_smoke_test_config() -> ExperimentConfig:
