@@ -3,6 +3,7 @@ __pycache__/
 
 # environments
 curvfed_env/
+curvfed/
 
 # datasets
 data/

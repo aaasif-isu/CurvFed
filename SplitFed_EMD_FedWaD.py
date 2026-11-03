@@ -974,17 +974,17 @@ class Client(object):
             batch_size=client_batch_size,
             shuffle=True,
             drop_last=True,
-            num_workers=4,
-            pin_memory=True,
-            persistent_workers=True,
+            num_workers=4 if torch.cuda.is_available() else 0,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=torch.cuda.is_available(),
         )
     #     self.ldr_test = DataLoader(
     #     DatasetSplit(dataset_test, idxs_test),
     #     batch_size=128,
     #     shuffle=False,
     #     num_workers=8,
-    #     pin_memory=True,
-    #     persistent_workers=True
+    #     pin_memory=torch.cuda.is_available(),
+    #     persistent_workers=torch.cuda.is_available()
     # )
         
 
@@ -1064,8 +1064,8 @@ def evaluate_global_model(
         dataset_test,
         batch_size=CONFIG.batch_size,
         shuffle=False,
-        num_workers=4,
-        pin_memory=True
+        num_workers=4 if torch.cuda.is_available() else 0,
+        pin_memory=torch.cuda.is_available()
     )
 
     criterion_eval = nn.CrossEntropyLoss()
