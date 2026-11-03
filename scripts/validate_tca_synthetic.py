@@ -21,53 +21,49 @@ from src.methods.tca import (
 )
 
 
-def run_synthetic_tca_benchmark(
-    num_clients: int = 12,
-    dim: int = 32,
-    num_trials: int = 50,
-    seed: int = 42,
-):
-    rng = np.random.default_rng(seed)
-    n_counts = np.array([400, 350, 300, 250] * (num_clients // 4), dtype=np.float64)
-    cluster_ids = np.repeat([0, 1, 2], num_clients // 3)
-    centers = rng.normal(0.0, 3.0, size=(3, dim))
-    true_client_means = np.array([centers[c] for c in cluster_ids], dtype=np.float64)
+def run_two_client_feedback_check(a: float = 0.25, q: float = 0.6, rounds: int = 100):
+    """2-client feedback check verifying uncalibrated over-mixing (a' ≈ 0.357, kappa ≈ 0.714)
+    vs lazy_calibrate restoring the target effective curvature (a'_cal = 0.250, kappa_cal = 0.500)."""
+    A = np.array([[1.0 - a, a], [a, 1.0 - a]], dtype=np.float64)
+    D = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float64)
+    st_A = plan_curvature(A, D)
+    kappa_A = float(st_A["kappa_mean"])
 
-    methods = [
-        ("fedavg", None),
-        ("tca_hard", ("hard", 0.5, 1.0, False)),
-        ("tca_unbalanced", ("unbalanced", 0.5, 1.0, False)),
-        ("tca_none", ("none", 0.5, 1.0, False)),
-        ("tca_calibrated", ("hard", 0.5, 1.0, True)),
-    ]
-    errors = {name: [] for name, _ in methods}
+    # Theoretical uncalibrated effective feedback operator: A_eff = (1 - q) * (I - q * A)^{-1} @ A
+    a_prime_expected = a / (1.0 - q * (1.0 - 2.0 * a))
+    kappa_eff_expected = 2.0 * a_prime_expected
 
-    for _ in range(num_trials):
-        noise_scale = 4.0 / np.sqrt(n_counts)[:, None]
-        observed = true_client_means + rng.normal(size=(num_clients, dim)) * noise_scale
-        D = build_cost_matrix("update", deltas=[observed[i] for i in range(num_clients)])
+    # Iterative simulation of theta^{(t+1)} = A @ (q * theta^{(t)} + (1 - q) * theta^*)
+    theta_star = np.eye(2, dtype=np.float64)
+    theta_uncal = theta_star.copy()
+    for _ in range(rounds):
+        theta_uncal = A @ (q * theta_uncal + (1.0 - q) * theta_star)
+    st_uncal = plan_curvature(theta_uncal, D)
+    a_prime_printed = float(theta_uncal[0, 1])
+    kappa_eff_printed = float(st_uncal["kappa_mean"])
 
-        p_weights = n_counts / n_counts.sum()
-        fedavg_vec = p_weights @ observed
-        errors["fedavg"].append(
-            float(np.mean(np.linalg.norm(fedavg_vec[None, :] - true_client_means, axis=1)))
-        )
+    # Calibrated feedback loop via lazy_calibrate
+    A_round, beta, target = lazy_calibrate(A, median_q=q, kappa_target="auto", D=D, curv_stats=st_A)
+    theta_cal = theta_star.copy()
+    for _ in range(rounds):
+        theta_cal = A_round @ (q * theta_cal + (1.0 - q) * theta_star)
+    st_cal = plan_curvature(theta_cal, D)
+    a_cal_printed = float(theta_cal[0, 1])
+    kappa_cal_printed = float(st_cal["kappa_mean"])
 
-        for name, cfg in methods[1:]:
-            marg, var_scale, tau, do_cal = cfg
-            v = build_variance_vector(n_counts, var_scale=var_scale)
-            A = solve_tca_plan(D, v, marginal=marg, tau=tau)
-            if do_cal:
-                A, _, _ = lazy_calibrate(A, median_q=1.25, kappa_target="auto", D=D)
-            est = A @ observed
-            errors[name].append(float(np.mean(np.linalg.norm(est - true_client_means, axis=1))))
-
-    print("================ TCA SYNTHETIC BENCHMARK ================")
-    for name, _ in methods:
-        arr = np.asarray(errors[name], dtype=np.float64)
-        print(f"{name:<18} | Mean L2 Error: {arr.mean():.4f} ± {arr.std(ddof=1):.4f}")
+    print("================ 2-CLIENT FEEDBACK CHECK ================")
+    print(f"Single-round plan: a = {a:.3f}, kappa_A = {kappa_A:.3f}, q = {q:.3f}")
+    print(
+        f"Uncalibrated feedback: expected a' = {a_prime_expected:.3f}, kappa = {kappa_eff_expected:.3f} | "
+        f"printed a' = {a_prime_printed:.3f}, kappa = {kappa_eff_printed:.3f}"
+    )
+    print(
+        f"Calibrated feedback (beta = {beta:.4f}): expected a' = {a:.3f}, kappa = {target:.3f} | "
+        f"printed a' = {a_cal_printed:.3f}, kappa = {kappa_cal_printed:.3f}"
+    )
     print("=========================================================")
 
 
 if __name__ == "__main__":
-    run_synthetic_tca_benchmark()
+    run_two_client_feedback_check()
+

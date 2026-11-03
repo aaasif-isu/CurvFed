@@ -341,8 +341,9 @@ def run_experiment(
             w_locals_server.append(w_server)
             server_weights_by_id[idx_int] = w_server
 
-        q_arr, median_q = estimate_q(norm_v1_list, norm_v2_list)
+        q_arr, median_q, q_half_raw_arr = estimate_q(norm_v1_list, norm_v2_list, return_raw=True)
         per_client_q = {int(cid): float(qv) for cid, qv in zip(active_users, q_arr)}
+        q_half_raw = {int(cid): float(rv) for cid, rv in zip(active_users, q_half_raw_arr)}
 
         nf_stats = None
         fedwad_dist = None
@@ -380,38 +381,42 @@ def run_experiment(
         kappa_mean = float("nan")
         sparsity = float("nan")
         inequality_violations = float("nan")
+        metric_violations = float("nan")
         beta_val = float("nan")
 
         if method == "baseline":
             w_glob_server = FedAvg(w_locals_server)
             w_glob_client = FedAvg(w_locals_client)
         elif method == "tca":
-            sample_weights = np.asarray(active_sample_counts, dtype=np.float64)
-            sample_weights = sample_weights / max(float(sample_weights.sum()), 1e-12)
+            rho = np.asarray(active_sample_counts, dtype=np.float64)
+            rho = rho / max(float(rho.sum()), 1e-12)
             v_vec = build_variance_vector(active_sample_counts, var_scale=config.tca_var_scale)
-            D_mat = build_cost_matrix(config.tca_cost, deltas=active_deltas, emd_matrix=emd)
+            D_norm = build_cost_matrix(config.tca_cost, deltas=active_deltas, emd_matrix=emd)
+            C = D_norm ** 2
             A_plan = solve_tca_plan(
-                D_mat,
+                C,
                 v_vec,
+                rho=rho,
                 marginal=config.tca_marginal,
                 tau=config.tca_tau,
             )
-            curv_stats = plan_curvature(A_plan, D_mat)
+            curv_stats = plan_curvature(A_plan, D_norm)
 
             if config.tca_calibrate:
                 A_plan, beta_val, _ = lazy_calibrate(
                     A_plan,
                     median_q=median_q,
                     kappa_target=config.tca_kappa_target,
-                    D=D_mat,
+                    D=D_norm,
                     curv_stats=curv_stats,
                 )
-                curv_stats = plan_curvature(A_plan, D_mat)
+                curv_stats = plan_curvature(A_plan, D_norm)
 
             kappa_min = float(curv_stats["kappa_min"])
             kappa_mean = float(curv_stats["kappa_mean"])
             sparsity = float(curv_stats["sparsity"])
             inequality_violations = int(curv_stats["inequality_violations"])
+            metric_violations = int(curv_stats["metric_violations"])
 
             np.save(os.path.join(rounds_csv_dir, f"A_round_{round_idx + 1:03d}.npy"), A_plan)
 
@@ -424,7 +429,7 @@ def run_experiment(
                 w_locals_client,
                 w_locals_server,
                 A_plan,
-                sample_weights,
+                rho,
                 [int(u) for u in active_users],
             )
             for cid_int in [int(u) for u in active_users]:
@@ -551,6 +556,8 @@ def run_experiment(
             "kappa_mean": kappa_mean,
             "sparsity": sparsity,
             "inequality_violations": inequality_violations,
+            "metric_violations": metric_violations,
+            "q_half_raw": json.dumps(q_half_raw),
             "per_client_q": json.dumps(per_client_q),
             "median_q": median_q,
             "beta": beta_val,
