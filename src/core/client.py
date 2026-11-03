@@ -2,6 +2,7 @@ import os
 import torch
 from torch.utils.data import DataLoader
 from ..data.partition import DatasetSplit
+from ..methods.tca import flatten_split_params
 
 
 class Client:
@@ -10,6 +11,7 @@ class Client:
         self.device = device
         self.lr = lr
         self.local_ep = local_ep
+        self.mid_param_vec = None
         client_batch_size = min(batch_size, max(1, len(idxs)))
         self.ldr_train = DataLoader(
             DatasetSplit(dataset_train, idxs),
@@ -26,6 +28,10 @@ class Client:
     def train(self, net, server, iter_epoch, smashed_dir=None, model_name=None):
         net.train()
         optimizer_client = torch.optim.Adam(net.parameters(), lr=self.lr)
+        total_steps = self.local_ep * len(self.ldr_train)
+        mid_step = max(1, total_steps // 2)
+        step_count = 0
+        self.mid_param_vec = None
 
         for iter_local in range(self.local_ep):
             len_batch = len(self.ldr_train)
@@ -53,11 +59,25 @@ class Client:
                                     f"client_{self.idx}_batch_{batch_idx:04d}.pt",
                                 ),
                             )
+                            torch.save(
+                                labels.detach().cpu().long(),
+                                os.path.join(
+                                    smashed_dir,
+                                    f"labels_{self.idx}_batch_{batch_idx:04d}.pt",
+                                ),
+                            )
 
                 dfx = server.train_step(client_fx, labels, iter_local, self.local_ep, self.idx, len_batch)
 
                 fx.backward(dfx)
                 optimizer_client.step()
+
+                step_count += 1
+                if step_count == mid_step:
+                    self.mid_param_vec = flatten_split_params(net, server.models[self.idx])
+
+        if self.mid_param_vec is None:
+            self.mid_param_vec = flatten_split_params(net, server.models[self.idx])
 
         return net.state_dict()
 

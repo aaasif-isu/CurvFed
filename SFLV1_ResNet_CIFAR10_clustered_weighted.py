@@ -18,13 +18,22 @@ from src.methods.curvfed_agg import (
 
 def main():
     parser = argparse.ArgumentParser(description="Run SplitFedV1 Weighted EMD + ORC.")
+    parser.add_argument("--config", "-c", type=str, default=None, help="Path to YAML config file.")
     parser.add_argument("--smoke-test", action="store_true", help="Run CPU smoke test.")
-    parser.add_argument("--noise-floor", action="store_true", help="Run EMD noise-floor Sanity Check A.")
+    parser.add_argument("--noise-floor", action="store_true", default=None, help="Run EMD noise-floor Sanity Check A.")
     args = parser.parse_args()
 
-    cfg = get_smoke_test_config() if args.smoke_test else CONFIG
+    from configs.default_config import load_config_from_yaml
+    if args.smoke_test:
+        cfg = get_smoke_test_config()
+    elif args.config:
+        cfg = load_config_from_yaml(args.config)
+    else:
+        cfg = CONFIG
     return run_experiment(
-        config=cfg, method="emd_orc_weighted", run_noise_floor=args.noise_floor or cfg.smoke_test
+        config=cfg,
+        method="emd_orc_weighted",
+        run_noise_floor=args.noise_floor if args.noise_floor is not None else (cfg.run_noise_floor or cfg.smoke_test),
     )
 
 

@@ -21,7 +21,15 @@ torch.set_num_threads(1)
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from configs.default_config import CONFIG, ExperimentConfig, _validate, get_smoke_test_config
+from configs.default_config import (
+    CONFIG,
+    DEFAULT_YAML_PATH,
+    ExperimentConfig,
+    _validate,
+    get_smoke_test_config,
+    load_config_from_yaml,
+    save_config_to_yaml,
+)
 from src.core.client import Client
 from src.core.server import Server
 from src.core.train_utils import FedAvg, clusterwise_fedavg
@@ -40,8 +48,18 @@ from src.methods.curvfed_agg import (
     compute_cluster_ari,
     compute_emd_for_round,
     compute_emd_noise_floor,
+    compute_fedwad_for_round,
     compute_ricci_for_round,
     make_round_dirs,
+)
+from src.methods.tca import (
+    build_cost_matrix,
+    estimate_q,
+    flatten_split_params,
+    lazy_calibrate,
+    plan_curvature,
+    solve_tca_plan,
+    tca_aggregate_split_models,
 )
 from src.models import build_model
 
@@ -118,31 +136,64 @@ def _evaluate_split_pair(
     return 100.0 * correct / total, total_loss / total
 
 
+def _canonicalize_method(method: str) -> str:
+    m = method.strip().lower()
+    if m == "fedavg":
+        return "baseline"
+    if m == "curvfed":
+        return "emd_orc"
+    return m
+
+
 def run_experiment(
     config: ExperimentConfig = CONFIG,
-    method: str = "baseline",
-    run_noise_floor: bool = True,
-    save_excel: bool = True,
+    method: Optional[str] = None,
+    run_noise_floor: Optional[bool] = None,
+    save_excel: Optional[bool] = None,
     output_dir: Optional[str] = None,
 ):
-    method = method.lower()
-    if method not in ("baseline", "emd_only", "emd_orc", "emd_orc_weighted"):
-        raise ValueError(f"Unsupported method: {method}")
+    raw_method = (method or config.method or "baseline").strip().lower()
+    canonical_method = _canonicalize_method(raw_method)
+    if canonical_method not in ("baseline", "emd_only", "emd_orc", "emd_orc_weighted", "fedwad", "tca"):
+        raise ValueError(f"Unsupported method: {raw_method}")
+    method = canonical_method
+
+    if run_noise_floor is None:
+        run_noise_floor = config.run_noise_floor
+    if save_excel is None:
+        save_excel = config.save_excel
+    resolved_output_dir = output_dir or config.output_dir
 
     set_seed(config.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    out_folder = output_dir or os.path.join(
-        "results",
-        f"{method}_{config.cluster_mode}_{config.zscore_mode}_{config.experiment_tag}",
-    )
+    if method == "tca":
+        default_sub = (
+            f"tca_{config.tca_mode}_{config.tca_cost}_{config.tca_marginal}_"
+            f"cal{int(config.tca_calibrate)}_{config.experiment_tag}"
+        )
+    else:
+        default_sub = f"{method}_{config.cluster_mode}_{config.zscore_mode}_{config.experiment_tag}"
+    out_folder = resolved_output_dir or os.path.join("results", default_sub)
     rounds_csv_dir = os.path.join(out_folder, "rounds")
     os.makedirs(rounds_csv_dir, exist_ok=True)
+
+    resolved_cfg = replace(
+        config,
+        method=method,
+        run_noise_floor=bool(run_noise_floor),
+        save_excel=bool(save_excel),
+        output_dir=out_folder,
+    )
+    save_config_to_yaml(resolved_cfg, os.path.join(out_folder, "resolved_config.yaml"))
 
     print(
         f"Using device: {device} | Running {method.upper()} "
         f"(model={config.model}, dataset={config.dataset}, "
-        f"cluster_mode={config.cluster_mode}, zscore_mode={config.zscore_mode}, "
-        f"consistent_split={config.consistent_split_weights})"
+        f"clients={config.num_users}, frac={config.frac}, alpha={config.alpha}, "
+        f"rounds={config.global_rounds}, cluster_mode={config.cluster_mode}, "
+        f"zscore_mode={config.zscore_mode}, consistent_split={config.consistent_split_weights}, "
+        f"tca_mode={config.tca_mode}, tca_cost={config.tca_cost}, "
+        f"tca_marginal={config.tca_marginal}, tca_calibrate={config.tca_calibrate})"
     )
 
     dataset_train, dataset_test, train_labels, test_labels = load_configured_datasets(config)
@@ -195,6 +246,12 @@ def run_experiment(
 
     w_glob_client = copy.deepcopy(client_model.state_dict())
     w_glob_server = copy.deepcopy(server.global_model.state_dict())
+    pers_client_states: Dict[int, dict] = {
+        i: copy.deepcopy(w_glob_client) for i in range(config.num_users)
+    }
+    pers_server_states: Dict[int, dict] = {
+        i: copy.deepcopy(w_glob_server) for i in range(config.num_users)
+    }
 
     metrics = {
         "global_acc_test": [],
@@ -216,7 +273,11 @@ def run_experiment(
         active_users = rng.choice(range(config.num_users), config.num_active_clients, replace=False)
         active_users = np.array(sorted(int(x) for x in active_users), dtype=np.int64)
 
-        use_smashed = (method != "baseline") or run_noise_floor or config.smoke_test
+        need_emd = (
+            method in ("emd_only", "emd_orc", "emd_orc_weighted", "fedwad")
+            or (method == "tca" and config.tca_cost == "emd")
+        )
+        use_smashed = need_emd or run_noise_floor or config.smoke_test
         if use_smashed:
             smashed_dir, out_dir, distrib_dir = make_round_dirs(round_idx, experiment_root=exp_work_dir)
         else:
@@ -226,6 +287,10 @@ def run_experiment(
         w_locals_server = []
         client_weights_by_id = {}
         server_weights_by_id = {}
+        active_sample_counts: List[int] = []
+        active_deltas: List[np.ndarray] = []
+        norm_v1_list: List[float] = []
+        norm_v2_list: List[float] = []
 
         for idx in active_users:
             idx_int = int(idx)
@@ -242,7 +307,14 @@ def run_experiment(
             )
 
             net = copy.deepcopy(client_model).to(device)
-            net.load_state_dict(w_glob_client)
+            if method == "tca" and config.tca_mode == "feedback":
+                net.load_state_dict(pers_client_states[idx_int])
+                server.models[idx_int].load_state_dict(pers_server_states[idx_int])
+            else:
+                net.load_state_dict(w_glob_client)
+                server.models[idx_int].load_state_dict(w_glob_server)
+
+            start_vec = flatten_split_params(net, server.models[idx_int])
             w_client = local.train(
                 net,
                 server,
@@ -250,6 +322,16 @@ def run_experiment(
                 smashed_dir=smashed_dir,
                 model_name=config.model,
             )
+            mid_vec = local.mid_param_vec if local.mid_param_vec is not None else start_vec
+            end_vec = flatten_split_params(net, server.models[idx_int])
+
+            v1 = mid_vec - start_vec
+            v2 = end_vec - mid_vec
+            norm_v1_list.append(float(np.linalg.norm(v1)))
+            norm_v2_list.append(float(np.linalg.norm(v2)))
+            active_deltas.append(end_vec - start_vec)
+            active_sample_counts.append(len(dict_users[idx_int]))
+
             w_client_copy = copy.deepcopy(w_client)
             w_locals_client.append(w_client_copy)
             client_weights_by_id[idx_int] = w_client_copy
@@ -258,12 +340,27 @@ def run_experiment(
             w_locals_server.append(w_server)
             server_weights_by_id[idx_int] = w_server
 
+        q_arr, median_q = estimate_q(norm_v1_list, norm_v2_list)
+        per_client_q = {int(cid): float(qv) for cid, qv in zip(active_users, q_arr)}
+
         nf_stats = None
+        fedwad_dist = None
+        emd = None
         if use_smashed:
             matrix_client_ids = build_distrib_for_round(
                 smashed_dir, distrib_dir, seed=config.seed, cleanup_smashed=True
             )
             emd = compute_emd_for_round(distrib_dir, out_dir, zscore_mode=config.zscore_mode)
+            if method == "fedwad" and config.distance_method == "fedwad":
+                fedwad_dist = compute_fedwad_for_round(
+                    distrib_dir,
+                    out_dir=out_dir,
+                    zscore_mode=config.zscore_mode,
+                    seed=config.seed + round_idx,
+                    n_supp=config.fedwad_n_supp,
+                    n_epoch=config.fedwad_epochs,
+                    t_val=config.fedwad_t,
+                )
             if run_noise_floor or config.smoke_test:
                 nf_stats = compute_emd_noise_floor(
                     distrib_dir,
@@ -278,14 +375,64 @@ def run_experiment(
         cluster_groups: Dict[int, List[int]] = {0: [int(u) for u in active_users]}
         cluster_models_server = None
         cluster_models_client = None
+        kappa_min = float("nan")
+        kappa_mean = float("nan")
+        sparsity = float("nan")
+        inequality_violations = float("nan")
+        beta_val = float("nan")
 
         if method == "baseline":
             w_glob_server = FedAvg(w_locals_server)
             w_glob_client = FedAvg(w_locals_client)
+        elif method == "tca":
+            v_vec = np.asarray(active_sample_counts, dtype=np.float64)
+            v_vec = v_vec / max(float(v_vec.sum()), 1e-12)
+            C_mat = build_cost_matrix(config.tca_cost, deltas=active_deltas, emd_matrix=emd)
+            A_plan = solve_tca_plan(C_mat, v_vec, marginal=config.tca_marginal, reg=config.tca_reg)
+            curv_stats = plan_curvature(A_plan, C_mat, v=v_vec)
+
+            if config.tca_calibrate:
+                A_plan, beta_val, _ = lazy_calibrate(
+                    A_plan,
+                    median_q=median_q,
+                    kappa_target=config.tca_kappa_target,
+                    C=C_mat,
+                    v=v_vec,
+                    curv_stats=curv_stats,
+                )
+                curv_stats = plan_curvature(A_plan, C_mat, v=v_vec)
+
+            kappa_min = float(curv_stats["kappa_min"])
+            kappa_mean = float(curv_stats["kappa_mean"])
+            sparsity = float(curv_stats["sparsity"])
+            inequality_violations = int(curv_stats["inequality_violations"])
+
+            np.save(os.path.join(rounds_csv_dir, f"A_round_{round_idx + 1:03d}.npy"), A_plan)
+
+            (
+                w_glob_client,
+                w_glob_server,
+                active_pers_client,
+                active_pers_server,
+            ) = tca_aggregate_split_models(
+                w_locals_client,
+                w_locals_server,
+                A_plan,
+                v_vec,
+                [int(u) for u in active_users],
+            )
+            for cid_int in [int(u) for u in active_users]:
+                pers_client_states[cid_int] = copy.deepcopy(active_pers_client[cid_int])
+                pers_server_states[cid_int] = copy.deepcopy(active_pers_server[cid_int])
         else:
             if method == "emd_only":
                 _, raw_groups = cluster_clients_from_emd(
                     emd, out_dir=out_dir, n_clusters=config.n_clusters, client_ids=matrix_client_ids
+                )
+            elif method == "fedwad":
+                dist_mat = fedwad_dist if fedwad_dist is not None else emd
+                _, raw_groups = cluster_clients_from_emd(
+                    dist_mat, out_dir=out_dir, n_clusters=config.n_clusters, client_ids=matrix_client_ids
                 )
             else:
                 ricci_graph = compute_ricci_for_round(emd, out_dir=out_dir)
@@ -323,7 +470,10 @@ def run_experiment(
         client_model.load_state_dict(w_glob_client)
         server.global_model.load_state_dict(w_glob_server)
         for i in range(config.num_users):
-            server.models[i].load_state_dict(w_glob_server)
+            if method == "tca" and config.tca_mode == "feedback":
+                server.models[i].load_state_dict(pers_server_states[i])
+            else:
+                server.models[i].load_state_dict(w_glob_server)
 
         global_acc, global_loss = _evaluate_split_pair(
             client_model, server.global_model, eval_test_dataset, config.batch_size, device
@@ -338,8 +488,16 @@ def run_experiment(
         pers_client_accs = []
         eval_c_net = copy.deepcopy(client_model).to(device)
         eval_s_net = copy.deepcopy(server.global_model).to(device)
-        for idx_int in [int(u) for u in active_users]:
-            if cluster_models_server is not None and idx_int in client_to_cluster_pos:
+        eval_client_ids = (
+            list(range(config.num_users))
+            if method == "tca"
+            else [int(u) for u in active_users]
+        )
+        for idx_int in eval_client_ids:
+            if method == "tca":
+                eval_c_net.load_state_dict(pers_client_states[idx_int])
+                eval_s_net.load_state_dict(pers_server_states[idx_int])
+            elif cluster_models_server is not None and idx_int in client_to_cluster_pos:
                 pos = client_to_cluster_pos[idx_int]
                 eval_s_net.load_state_dict(cluster_models_server[pos])
                 if cluster_models_client is not None:
@@ -366,6 +524,10 @@ def run_experiment(
             "zscore_mode": config.zscore_mode,
             "cluster_mode": config.cluster_mode,
             "consistent_split_weights": config.consistent_split_weights,
+            "tca_mode": config.tca_mode if method == "tca" else "N/A",
+            "tca_cost": config.tca_cost if method == "tca" else "N/A",
+            "tca_marginal": config.tca_marginal if method == "tca" else "N/A",
+            "tca_calibrate": bool(config.tca_calibrate) if method == "tca" else False,
             "round": round_idx + 1,
             "global_acc_test": global_acc,
             "global_loss_test": global_loss,
@@ -379,6 +541,13 @@ def run_experiment(
             "emd_snr": nf_stats["snr"] if nf_stats else float("nan"),
             "personalized_mean_acc": pers_mean_acc,
             "personalized_min_acc": pers_min_acc,
+            "kappa_min": kappa_min,
+            "kappa_mean": kappa_mean,
+            "sparsity": sparsity,
+            "inequality_violations": inequality_violations,
+            "per_client_q": json.dumps(per_client_q),
+            "median_q": median_q,
+            "beta": beta_val,
             "round_time_sec": round_time,
         }
 
@@ -392,11 +561,17 @@ def run_experiment(
         metrics["personalized_min_acc"].append(pers_min_acc)
         metrics["round_time_sec"].append(round_time)
 
+        tca_info = (
+            f" | kappa(min/mean): {kappa_min:.3f}/{kappa_mean:.3f} | "
+            f"sparsity: {sparsity:.3f} | q_med: {median_q:.3f} | beta: {beta_val:.3f}"
+            if method == "tca"
+            else ""
+        )
         print(
             f"Round {round_idx + 1}/{config.global_rounds} | "
             f"Method: {method.upper()} | Global Acc: {global_acc:.2f}% | "
             f"Pers Mean/Min: {pers_mean_acc:.2f}%/{pers_min_acc:.2f}% | "
-            f"ARI: {ari_prev:.3f} | Time: {round_time:.2f}s"
+            f"ARI: {ari_prev:.3f}{tca_info} | Time: {round_time:.2f}s"
         )
 
     if os.path.exists(exp_work_dir):
@@ -414,19 +589,55 @@ def run_experiment(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run CurvFed SplitFed experiment.")
+    parser = argparse.ArgumentParser(
+        description="Run CurvFed SplitFed experiment (reads config.yaml by default)."
+    )
+    parser.add_argument(
+        "--config",
+        "-c",
+        type=str,
+        default=None,
+        help=f"Path to YAML configuration file (defaults to {DEFAULT_YAML_PATH}).",
+    )
     parser.add_argument(
         "--method",
         type=str,
-        default="baseline",
-        choices=["baseline", "emd_only", "emd_orc", "emd_orc_weighted"],
-        help="Aggregation method to run.",
+        default=None,
+        choices=[
+            "baseline",
+            "fedavg",
+            "emd_only",
+            "emd_orc",
+            "curvfed",
+            "emd_orc_weighted",
+            "fedwad",
+            "tca",
+        ],
+        help="Aggregation method to run (overrides 'method' in YAML).",
     )
     parser.add_argument("--smoke-test", action="store_true", help="Use CPU smoke-test config.")
-    parser.add_argument("--noise-floor", action="store_true", default=True, help="Run Sanity Check A.")
+    parser.add_argument(
+        "--noise-floor",
+        dest="noise_floor",
+        action="store_true",
+        default=None,
+        help="Enable Sanity Check A (within/cross EMD SNR).",
+    )
+    parser.add_argument(
+        "--no-noise-floor",
+        dest="noise_floor",
+        action="store_false",
+        help="Disable Sanity Check A.",
+    )
     parser.add_argument("--cluster-mode", type=str, default=None, choices=["geometry", "random"])
     parser.add_argument("--zscore-mode", type=str, default=None, choices=["per_client", "pooled", "none"])
     parser.add_argument("--consistent-split-weights", type=int, default=None, choices=[0, 1])
+    parser.add_argument("--tca-mode", type=str, default=None, choices=["decoupled", "feedback"])
+    parser.add_argument("--tca-cost", type=str, default=None, choices=["update", "emd"])
+    parser.add_argument("--tca-marginal", type=str, default=None, choices=["hard", "none"])
+    parser.add_argument("--tca-calibrate", type=int, default=None, choices=[0, 1])
+    parser.add_argument("--tca-kappa-target", type=str, default=None)
+    parser.add_argument("--tca-reg", type=float, default=None)
     parser.add_argument("--dataset", type=str, default=None, choices=["cifar10", "mnist", "shakespeare"])
     parser.add_argument("--model", type=str, default=None, choices=["resnet18", "smallcnn", "charlstm"])
     parser.add_argument("--num-users", type=int, default=None)
@@ -441,14 +652,37 @@ def main():
     parser.add_argument("--output-dir", type=str, default=None)
     args = parser.parse_args()
 
-    cfg = get_smoke_test_config() if args.smoke_test else CONFIG
+    if args.smoke_test:
+        cfg = get_smoke_test_config()
+    elif args.config is not None:
+        cfg = load_config_from_yaml(args.config)
+    else:
+        cfg = CONFIG
+
     overrides = {}
+    if args.method is not None:
+        overrides["method"] = args.method
+    if args.noise_floor is not None:
+        overrides["run_noise_floor"] = bool(args.noise_floor)
     if args.cluster_mode is not None:
         overrides["cluster_mode"] = args.cluster_mode
     if args.zscore_mode is not None:
         overrides["zscore_mode"] = args.zscore_mode
     if args.consistent_split_weights is not None:
         overrides["consistent_split_weights"] = bool(args.consistent_split_weights)
+    if args.tca_mode is not None:
+        overrides["tca_mode"] = args.tca_mode
+    if args.tca_cost is not None:
+        overrides["tca_cost"] = args.tca_cost
+    if args.tca_marginal is not None:
+        overrides["tca_marginal"] = args.tca_marginal
+    if args.tca_calibrate is not None:
+        overrides["tca_calibrate"] = bool(args.tca_calibrate)
+    if args.tca_kappa_target is not None:
+        kt_str = args.tca_kappa_target.strip().lower()
+        overrides["tca_kappa_target"] = "auto" if kt_str == "auto" else float(kt_str)
+    if args.tca_reg is not None:
+        overrides["tca_reg"] = float(args.tca_reg)
     if args.dataset is not None:
         overrides["dataset"] = args.dataset
     if args.model is not None:
@@ -471,6 +705,8 @@ def main():
         overrides["learning_rate"] = args.lr
     if args.seed is not None:
         overrides["seed"] = args.seed
+    if args.output_dir is not None:
+        overrides["output_dir"] = args.output_dir
 
     if overrides:
         cfg = replace(cfg, **overrides)
@@ -478,9 +714,10 @@ def main():
 
     run_experiment(
         config=cfg,
-        method=args.method,
-        run_noise_floor=args.noise_floor or cfg.smoke_test,
-        output_dir=args.output_dir,
+        method=cfg.method,
+        run_noise_floor=cfg.run_noise_floor or cfg.smoke_test,
+        save_excel=cfg.save_excel,
+        output_dir=cfg.output_dir,
     )
 
 

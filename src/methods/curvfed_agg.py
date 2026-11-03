@@ -45,6 +45,7 @@ def build_distrib_for_round(
 ) -> List[int]:
     os.makedirs(distrib_dir, exist_ok=True)
     client_batches: Dict[int, List[torch.Tensor]] = {}
+    client_label_batches: Dict[int, List[torch.Tensor]] = {}
 
     for fname in sorted(os.listdir(smashed_dir)):
         if not (fname.startswith("client_") and fname.endswith(".pt")):
@@ -56,13 +57,25 @@ def build_distrib_for_round(
             x = x.view(x.size(0), -1)
         client_batches.setdefault(client_id, []).append(x)
 
+        lbl_fname = f"labels_{parts[1]}_batch_{parts[3]}.pt" if len(parts) >= 4 else ""
+        lbl_path = os.path.join(smashed_dir, lbl_fname)
+        if lbl_fname and os.path.exists(lbl_path):
+            y = torch.load(lbl_path, map_location="cpu").long()
+            client_label_batches.setdefault(client_id, []).append(y)
+
     for client_id, tensors in sorted(client_batches.items()):
         x_all = torch.cat(tensors, dim=0)
+        y_list = client_label_batches.get(client_id, [])
+        y_all = torch.cat(y_list, dim=0) if len(y_list) == len(tensors) and y_list else None
         if x_all.size(0) > cap:
             generator = torch.Generator().manual_seed(seed + int(client_id))
             selected = torch.randperm(x_all.size(0), generator=generator)[:cap]
             x_all = x_all[selected]
+            if y_all is not None and y_all.size(0) >= selected.max().item() + 1:
+                y_all = y_all[selected]
         torch.save(x_all, os.path.join(distrib_dir, f"client{client_id}.pt"))
+        if y_all is not None:
+            torch.save(y_all, os.path.join(distrib_dir, f"labels_client{client_id}.pt"))
 
     if cleanup_smashed and os.path.exists(smashed_dir):
         shutil.rmtree(smashed_dir, ignore_errors=True)
@@ -445,6 +458,83 @@ def compute_cluster_ari(
     prev_labels = [prev_map[cid] for cid in common_clients]
     curr_labels = [curr_map[cid] for cid in common_clients]
     return float(adjusted_rand_score(prev_labels, curr_labels))
+
+
+def _augment_for_fedotdd(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Diagonal class-conditional OTDD feature augmentation for FedWaD."""
+    augmented = np.empty((x.shape[0], 3 * x.shape[1]), dtype=np.float64)
+    for class_id in np.unique(y):
+        mask = y == class_id
+        class_x = x[mask]
+        mean = class_x.mean(axis=0)
+        variance = class_x.var(axis=0, ddof=1) if class_x.shape[0] > 1 else np.zeros(x.shape[1], dtype=np.float64)
+        std = np.sqrt(np.maximum(variance, 0.0) + 1e-6)
+        augmented[mask] = np.concatenate(
+            [
+                class_x,
+                np.repeat(mean[None, :], class_x.shape[0], axis=0),
+                np.repeat(std[None, :], class_x.shape[0], axis=0),
+            ],
+            axis=1,
+        )
+    return augmented
+
+
+def compute_fedwad_for_round(
+    distrib_dir: str,
+    out_dir: Optional[str] = None,
+    zscore_mode: str = "per_client",
+    seed: int = 42,
+    n_supp: int = 10,
+    n_epoch: int = 20,
+    t_val: float = 0.5,
+) -> np.ndarray:
+    """Compute pairwise FedWaD (FedOTDD interpolating measure) distance matrix across active clients."""
+    from FedWaD import FedOT
+
+    files = sorted(glob(os.path.join(distrib_dir, "client*.pt")), key=_client_id_from_path)
+    if not files:
+        raise RuntimeError(f"No client distribution files found in {distrib_dir}")
+
+    client_ids = [_client_id_from_path(f) for f in files]
+    raw_clouds = [torch.load(f, map_location="cpu").float().numpy() for f in files]
+    Xs = _normalize_client_clouds(raw_clouds, zscore_mode=zscore_mode)
+
+    augmented = []
+    for cid, x in zip(client_ids, Xs):
+        lbl_path = os.path.join(distrib_dir, f"labels_client{cid}.pt")
+        if os.path.exists(lbl_path):
+            y = torch.load(lbl_path, map_location="cpu").long().numpy()
+            augmented.append(_augment_for_fedotdd(x, y))
+        else:
+            augmented.append(x)
+
+    k = len(augmented)
+    distances = np.zeros((k, k), dtype=np.float64)
+    numpy_state = np.random.get_state()
+    try:
+        for i in range(k):
+            for j in range(i + 1, k):
+                np.random.seed(seed + i * k + j)
+                fedwad = FedOT(
+                    n_supp=n_supp,
+                    n_epoch=n_epoch,
+                    t_val=t_val,
+                    verbose=False,
+                    metric="sqeuclidean",
+                )
+                fedwad.fit(augmented[i], augmented[j], approx_interp=True)
+                dist_val = float(fedwad.cost ** 2)
+                distances[i, j] = distances[j, i] = dist_val
+    finally:
+        np.random.set_state(numpy_state)
+
+    if out_dir is not None:
+        os.makedirs(out_dir, exist_ok=True)
+        np.save(os.path.join(out_dir, f"fedwad_matrix_supp{n_supp}_epochs{n_epoch}.npy"), distances)
+
+    return distances
+
 
 
 

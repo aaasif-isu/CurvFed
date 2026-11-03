@@ -7,9 +7,19 @@ from .curvfed_agg import (
     compute_cluster_ari,
     compute_emd_for_round,
     compute_emd_noise_floor,
+    compute_fedwad_for_round,
     compute_ricci_distance_matrix,
     compute_ricci_for_round,
     make_round_dirs,
+)
+from .tca import (
+    build_cost_matrix,
+    estimate_q,
+    flatten_split_params,
+    lazy_calibrate,
+    plan_curvature,
+    solve_tca_plan,
+    tca_aggregate_split_models,
 )
 
 __all__ = [
@@ -18,10 +28,19 @@ __all__ = [
     "_normalize_client_clouds",
     "compute_emd_for_round",
     "compute_emd_noise_floor",
+    "compute_fedwad_for_round",
     "compute_ricci_for_round",
     "compute_ricci_distance_matrix",
     "cluster_clients_from_ricci",
     "cluster_clients_from_emd",
     "apply_cluster_mode",
     "compute_cluster_ari",
+    "flatten_split_params",
+    "estimate_q",
+    "build_cost_matrix",
+    "solve_tca_plan",
+    "plan_curvature",
+    "lazy_calibrate",
+    "tca_aggregate_split_models",
 ]
+

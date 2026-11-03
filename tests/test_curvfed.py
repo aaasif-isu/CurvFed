@@ -251,3 +251,110 @@ def test_iid_partition_is_disjoint_and_covers_dataset():
     assert len(all_assigned) == num_samples
     assert set(all_assigned) == set(range(num_samples))
 
+
+def test_load_and_save_yaml_config(tmp_path):
+    """6. YAML configuration file loads all parameters accurately and validates keys."""
+    from configs.default_config import (
+        DEFAULT_YAML_PATH,
+        load_config_from_yaml,
+        save_config_to_yaml,
+    )
+
+    # Default repo config.yaml must load cleanly
+    assert DEFAULT_YAML_PATH.exists()
+    default_cfg = load_config_from_yaml(DEFAULT_YAML_PATH)
+    assert default_cfg.method in ("baseline", "emd_only", "emd_orc", "emd_orc_weighted", "fedwad")
+
+    # Custom YAML with specific parameters
+    custom_yaml = tmp_path / "custom_exp.yaml"
+    custom_yaml.write_text(
+        """
+method: "emd_only"
+dataset: "mnist"
+model: "smallcnn"
+num_users: 10
+frac: 0.5
+alpha: 0.1
+seed: 123
+global_rounds: 3
+local_epochs: 2
+learning_rate: 0.005
+batch_size: 32
+n_clusters: 2
+cluster_mode: "random"
+zscore_mode: "pooled"
+consistent_split_weights: false
+run_noise_floor: false
+save_excel: false
+output_dir: "results/test_yaml_run"
+""",
+        encoding="utf-8",
+    )
+    cfg = load_config_from_yaml(custom_yaml)
+    assert cfg.method == "emd_only"
+    assert cfg.dataset == "mnist"
+    assert cfg.model == "smallcnn"
+    assert cfg.num_users == 10
+    assert cfg.frac == 0.5
+    assert cfg.num_active_clients == 5
+    assert cfg.alpha == 0.1
+    assert cfg.seed == 123
+    assert cfg.global_rounds == 3
+    assert cfg.local_epochs == 2
+    assert cfg.learning_rate == 0.005
+    assert cfg.batch_size == 32
+    assert cfg.n_clusters == 2
+    assert cfg.cluster_mode == "random"
+    assert cfg.zscore_mode == "pooled"
+    assert cfg.consistent_split_weights is False
+    assert cfg.run_noise_floor is False
+    assert cfg.save_excel is False
+    assert cfg.output_dir == "results/test_yaml_run"
+
+    # Round-trip save and reload
+    saved_yaml = tmp_path / "saved.yaml"
+    save_config_to_yaml(cfg, saved_yaml)
+    reloaded = load_config_from_yaml(saved_yaml)
+    assert reloaded == cfg
+
+    # Unknown key raises helpful ValueError
+    bad_yaml = tmp_path / "bad.yaml"
+    bad_yaml.write_text("non_existent_param: 42\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Unknown parameter"):
+        load_config_from_yaml(bad_yaml)
+
+
+def test_fedwad_for_round_from_distrib(tmp_path):
+    """7. build_distrib_for_round and compute_fedwad_for_round produce a valid symmetric distance matrix."""
+    from src.methods.curvfed_agg import build_distrib_for_round, compute_fedwad_for_round
+
+    smashed_dir = tmp_path / "smashed"
+    distrib_dir = tmp_path / "distrib"
+    out_dir = tmp_path / "out"
+    smashed_dir.mkdir(parents=True)
+
+    torch.manual_seed(42)
+    for cid in range(3):
+        feats = torch.randn(16, 8) + cid * 1.5
+        lbls = torch.randint(0, 3, (16,))
+        torch.save(feats, smashed_dir / f"client_{cid}_batch_0000.pt")
+        torch.save(lbls, smashed_dir / f"labels_{cid}_batch_0000.pt")
+
+    cids = build_distrib_for_round(str(smashed_dir), str(distrib_dir), seed=42)
+    assert cids == [0, 1, 2]
+
+    dist = compute_fedwad_for_round(
+        str(distrib_dir),
+        out_dir=str(out_dir),
+        zscore_mode="pooled",
+        seed=42,
+        n_supp=4,
+        n_epoch=3,
+        t_val=0.5,
+    )
+    assert dist.shape == (3, 3)
+    assert np.allclose(dist, dist.T)
+    assert np.allclose(np.diag(dist), 0.0)
+
+
+
