@@ -1,4 +1,5 @@
-"""Shared datasets for configured SplitFed experiments."""
+"""Shared datasets for configured Federated Learning experiments."""
+
 
 from pathlib import Path
 from urllib.request import urlretrieve

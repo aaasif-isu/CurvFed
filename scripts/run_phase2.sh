@@ -31,16 +31,12 @@ for ALPHA in "${ALPHAS[@]}"; do
             --model resnet18
             --num-users 10
             --frac 1.0
-            --n-clusters 3
             --alpha "${ALPHA}"
             --rounds 50
             --local-epochs 1
             --batch-size 256
             --lr 0.0001
             --seed "${SEED}"
-            --consistent-split-weights 1
-            --cluster-mode geometry
-            --zscore-mode pooled
         )
 
         BASE_OUT="${RESULTS_ROOT}/alpha_${ALPHA}"
@@ -50,23 +46,14 @@ for ALPHA in "${ALPHAS[@]}"; do
         echo "------------------------------------------------------------"
 
         # 1. fedavg
-        echo "[1/7] fedavg (alpha=${ALPHA}, seed=${SEED})..."
+        echo "[1/5] fedavg (alpha=${ALPHA}, seed=${SEED})..."
         "${PYTHON_BIN}" scripts/run_experiment.py \
             "${COMMON_ARGS[@]}" \
             --method fedavg \
             --output-dir "${BASE_OUT}/fedavg/seed_${SEED}"
 
-        # 2. curvfed (fixed version: geometry clusters, pooled z-score)
-        echo "[2/7] curvfed (geometry, pooled) (alpha=${ALPHA}, seed=${SEED})..."
-        "${PYTHON_BIN}" scripts/run_experiment.py \
-            "${COMMON_ARGS[@]}" \
-            --method curvfed \
-            --cluster-mode geometry \
-            --zscore-mode pooled \
-            --output-dir "${BASE_OUT}/curvfed/seed_${SEED}"
-
-        # 3. tca decoupled, cost = update, marginal = hard
-        echo "[3/7] tca decoupled (cost=update, marginal=hard) (alpha=${ALPHA}, seed=${SEED})..."
+        # 2. tca decoupled, cost = update, marginal = hard
+        echo "[2/5] tca decoupled (cost=update, marginal=hard) (alpha=${ALPHA}, seed=${SEED})..."
         "${PYTHON_BIN}" scripts/run_experiment.py \
             "${COMMON_ARGS[@]}" \
             --method tca \
@@ -76,8 +63,8 @@ for ALPHA in "${ALPHAS[@]}"; do
             --tca-calibrate 0 \
             --output-dir "${BASE_OUT}/tca_decoupled_update_hard/seed_${SEED}"
 
-        # 4. tca decoupled, cost = update, marginal = none
-        echo "[4/7] tca decoupled (cost=update, marginal=none) (alpha=${ALPHA}, seed=${SEED})..."
+        # 3. tca decoupled, cost = update, marginal = none
+        echo "[3/5] tca decoupled (cost=update, marginal=none) (alpha=${ALPHA}, seed=${SEED})..."
         "${PYTHON_BIN}" scripts/run_experiment.py \
             "${COMMON_ARGS[@]}" \
             --method tca \
@@ -87,19 +74,8 @@ for ALPHA in "${ALPHAS[@]}"; do
             --tca-calibrate 0 \
             --output-dir "${BASE_OUT}/tca_decoupled_update_none/seed_${SEED}"
 
-        # 5. tca decoupled, cost = emd, marginal = hard
-        echo "[5/7] tca decoupled (cost=emd, marginal=hard) (alpha=${ALPHA}, seed=${SEED})..."
-        "${PYTHON_BIN}" scripts/run_experiment.py \
-            "${COMMON_ARGS[@]}" \
-            --method tca \
-            --tca-mode decoupled \
-            --tca-cost emd \
-            --tca-marginal hard \
-            --tca-calibrate 0 \
-            --output-dir "${BASE_OUT}/tca_decoupled_emd_hard/seed_${SEED}"
-
-        # 6. tca feedback, calibrate = false
-        echo "[6/7] tca feedback (calibrate=false) (alpha=${ALPHA}, seed=${SEED})..."
+        # 4. tca feedback, calibrate = false
+        echo "[4/5] tca feedback (calibrate=false) (alpha=${ALPHA}, seed=${SEED})..."
         "${PYTHON_BIN}" scripts/run_experiment.py \
             "${COMMON_ARGS[@]}" \
             --method tca \
@@ -109,8 +85,8 @@ for ALPHA in "${ALPHAS[@]}"; do
             --tca-calibrate 0 \
             --output-dir "${BASE_OUT}/tca_feedback_uncalibrated/seed_${SEED}"
 
-        # 7. tca feedback, calibrate = true
-        echo "[7/7] tca feedback (calibrate=true, kappa_target=auto) (alpha=${ALPHA}, seed=${SEED})..."
+        # 5. tca feedback, calibrate = true
+        echo "[5/5] tca feedback (calibrate=true, kappa_target=auto) (alpha=${ALPHA}, seed=${SEED})..."
         "${PYTHON_BIN}" scripts/run_experiment.py \
             "${COMMON_ARGS[@]}" \
             --method tca \
@@ -120,6 +96,8 @@ for ALPHA in "${ALPHAS[@]}"; do
             --tca-calibrate 1 \
             --tca-kappa-target auto \
             --output-dir "${BASE_OUT}/tca_feedback_calibrated/seed_${SEED}"
+
+
     done
 done
 

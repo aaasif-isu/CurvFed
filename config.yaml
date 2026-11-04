@@ -8,13 +8,13 @@
 # Select one preset from `experiments` below (or set to "none" / "" to use base keys only):
 # Valid presets:
 #   debug, fedavg_debug, fedavg, tca_decoupled, tca_local, tca_vs0.01, tca_vs0.1, tca_vs10,
-#   curvfed_geometry, curvfed_random, tca_feedback_uncal, tca_feedback_cal
+#   tca_feedback_uncal, tca_feedback_cal
 experiment: "fedavg"
 
 # ---------------------------------------------------------------------
 # Base Experiment Knobs (overridden by the selected preset above)
 # ---------------------------------------------------------------------
-method: "tca"               # "fedavg"/"baseline", "emd_only", "curvfed"/"emd_orc", "emd_orc_weighted", "fedwad", "tca"
+method: "tca"               # "fedavg" ("baseline") or "tca"
 dataset: "cifar10"          # "cifar10", "mnist", "shakespeare"
 model: "resnet18"           # "resnet18", "smallcnn", "charlstm"
 
@@ -23,18 +23,11 @@ frac: 1.0                   # Active client fraction per round (0 < frac <= 1.0)
 alpha: 0.1                  # Dirichlet non-IID concentration (e.g. 0.1, 0.5, 1.0, or 999999 for IID)
 seed: 42                    # Random seed
 
-global_rounds: 50           # Number of global training rounds
+global_rounds: 20           # Number of global training rounds
 local_epochs: 1             # Number of local epochs per client per round
 lr: 0.0001                  # Learning rate
 batch_size: 256             # Batch size
 
-n_clusters: 3               # Number of client clusters for CurvFed / EMD methods
-cluster_mode: "geometry"    # "geometry" or "random"
-zscore_mode: "pooled"       # "per_client", "pooled", or "none"
-distance_method: "emd"      # "emd" or "fedwad"
-
-consistent_split_weights: true
-run_noise_floor: true
 save_excel: true
 max_samples_per_client: null
 max_test_samples: null
@@ -42,12 +35,13 @@ max_test_samples: null
 # TCA parameters
 tca:
   mode: "decoupled"         # "decoupled" or "feedback"
-  cost: "update"            # "update" or "emd"
+  cost: "update"            # "update" (pairwise model-update Euclidean distance)
   marginal: "hard"          # "hard", "unbalanced", or "none"
   tau: 1.0                  # KL penalty weight when marginal: "unbalanced"
   var_scale: 1.0            # Per-client variance weight scale: v_k = var_scale * mean(n) / n_k
   calibrate: false          # true or false (lazy_calibrate in feedback mode)
   kappa_target: "auto"      # "auto" (= mean kappa of uncalibrated plan) or float
+
 
 # ---------------------------------------------------------------------
 # Named Experiment Presets (deep-merged over the base keys above)
@@ -58,7 +52,6 @@ experiments:
     model: "smallcnn"
     num_users: 4
     frac: 1.0
-    n_clusters: 2
     global_rounds: 2
     batch_size: 64
     lr: 0.001
@@ -73,7 +66,6 @@ experiments:
     model: "smallcnn"
     num_users: 4
     frac: 1.0
-    n_clusters: 2
     global_rounds: 2
     batch_size: 64
     lr: 0.001
@@ -116,16 +108,6 @@ experiments:
       mode: "decoupled"
       var_scale: 10.0
 
-  curvfed_geometry:
-    method: "curvfed"
-    cluster_mode: "geometry"
-    zscore_mode: "pooled"
-
-  curvfed_random:
-    method: "curvfed"
-    cluster_mode: "random"
-    zscore_mode: "pooled"
-
   tca_feedback_uncal:
     method: "tca"
     tca:
@@ -137,4 +119,5 @@ experiments:
     tca:
       mode: "feedback"
       calibrate: true
+
 

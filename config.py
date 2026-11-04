@@ -6,26 +6,18 @@ from configs.default_config import (
     CHARLSTM_EMBED_DIM,
     CHARLSTM_HIDDEN_SIZE,
     CHARLSTM_NUM_LAYERS,
-    CLUSTER_MODE,
     CONFIG,
-    CONSISTENT_SPLIT_WEIGHTS,
     DATA_ROOT,
     DATASET,
     DATASET_CHANNELS,
     DATASET_NUM_CLASSES,
     DEFAULT_YAML_PATH,
-    DISTANCE_METHOD,
-    DISTANCE_POOL_SIZE,
-    FEDWAD_EPOCHS,
-    FEDWAD_N_SUPP,
-    FEDWAD_T,
     FRAC,
     GLOBAL_ROUNDS,
     LEARNING_RATE,
     LOCAL_EPOCHS,
     METHOD,
     MODEL,
-    N_CLUSTERS,
     NUM_USERS,
     SEED,
     SHAKESPEARE_DOWNLOAD_URL,
@@ -41,7 +33,6 @@ from configs.default_config import (
     TCA_REG,
     TCA_TAU,
     TCA_VAR_SCALE,
-    ZSCORE_MODE,
     DatasetName,
     ExperimentConfig,
     MethodName,
@@ -51,6 +42,7 @@ from configs.default_config import (
     load_config_from_yaml,
     save_config_to_yaml,
 )
+
 
 __all__ = [
     "CONFIG",
@@ -62,4 +54,5 @@ __all__ = [
     "save_config_to_yaml",
     "_validate",
 ]
+
 

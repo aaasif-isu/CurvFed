@@ -1,323 +1,162 @@
-# CurvFed: SplitFed Experiments with Distribution-Aware Client Aggregation
+# CurvFed: Federated Learning with Transport-Curvature Aggregation (TCA)
 
-This repository contains SplitFed Learning experiments comparing five aggregation strategies under IID and non-IID client data distributions:
+This repository implements standard **centralized-server Federated Learning (FL)** comparing **FedAvg (baseline)** and personalized **Transport-Curvature Aggregation (TCA)** under IID and Dirichlet non-IID client data distributions.
 
-1. **Baseline SplitFed**
-2. **EMD-only**
-3. **EMD + ORC** (Earth Mover's Distance with Ollivier–Ricci curvature)
-4. **Weighted EMD + ORC**
-5. **FedWaD-only**
+## Architecture Overview
 
-The current experiments support CIFAR-10 and MNIST with ResNet18, and Shakespeare with a character-level LSTM.
+- **Clients (`src/core/client.py`)**: Each active client trains a complete neural network (`ResNet18`, `SmallCNN`, or `CharLSTM`) locally using standard forward and backward propagation on its private dataset shard.
+- **Central Server (`src/core/server.py`)**: Coordinates client initialization and aggregates complete client model updates without participating in forward/backward propagation.
+  - In **FedAvg (`fedavg` / `baseline`)** and **TCA `decoupled` mode**, active clients start each round from the current global model $\theta_{\text{glob}}^{(t)}$.
+  - In **TCA `feedback` mode**, each active client starts its next local training round from its own personalized model $\theta_i^{(t)}$.
 
-## Experiment configurations
+## Supported Aggregation Methods
 
-| Dataset | Model | Valid configuration |
+1. **FedAvg (`fedavg` / `baseline`)** — Standard sample-weighted Federated Averaging across active client models ($\theta_{\text{glob}} = \sum_k \rho_k \theta_k$).
+2. **Transport-Curvature Aggregation (`tca`)** — Optimal-transport-based personalized and global model aggregation with Ollivier–Ricci plan curvature diagnostics and lazy feedback calibration:
+   - **Modes (`tca.mode`)**: `decoupled` (clients initialize from global model) or `feedback` (clients initialize from their personalized models)
+   - **Cost matrix (`tca.cost`)**: `update` (median-normalized pairwise Euclidean distance between client model update vectors $\Delta \theta_k$)
+   - **Marginal constraints (`tca.marginal`)**: `hard` (column marginal matched to sample weights $\rho$), `unbalanced` (KL divergence penalty with weight `tca.tau`), or `none` (unconstrained row-wise quadratic program)
+   - **Variance regularization (`tca.var_scale`)**: Per-client variance weight $v_k = \text{var\_scale} \cdot \bar{n} / n_k$
+   - **Curvature calibration (`tca.calibrate`, `tca.kappa_target`)**: Lazy mixing $(1 - \beta) I + \beta A$ using the estimated half-round contraction rate $q$
+
+## Supported Datasets and Models
+
+| Dataset | Model | Configuration |
 |---|---|---|
-| CIFAR-10 | ResNet18 | `DATASET="cifar10"`, `MODEL="resnet18"` |
-| MNIST | ResNet18 | `DATASET="mnist"`, `MODEL="resnet18"` |
-| Shakespeare | CharLSTM | `DATASET="shakespeare"`, `MODEL="charlstm"` |
+| CIFAR-10 | ResNet18 / SmallCNN | `dataset: "cifar10"`, `model: "resnet18"` or `"smallcnn"` |
+| MNIST | ResNet18 / SmallCNN | `dataset: "mnist"`, `model: "resnet18"` or `"smallcnn"` |
+| Shakespeare | CharLSTM | `dataset: "shakespeare"`, `model: "charlstm"` |
 
-Two client settings are used in the reported experiments:
-
-| Setting | `NUM_USERS` | `FRAC` | Active clients per round |
-|---|---:|---:|---:|
-| 10 clients | 10 | 1.0 | 10 |
-| 100 clients | 100 | 0.1 | 10 |
-
-The default experiment uses 50 global rounds, one local epoch, Dirichlet `alpha=0.5`, and seed 42.
-
-## Repository structure
+## Repository Structure
 
 ```text
 CurvFed/
-├── config.py                         # Central experiment configuration
-├── experiment_support.py             # Dataset/model/experiment utilities
-├── SFLV1_ResNet_CIFAR10.py           # Baseline entry point
-├── SFLV1_ResNet_CIFAR10_EMD_only.py  # EMD-only entry point
-├── SFLV1_ResNet_CIFAR10_clustered.py # EMD + ORC entry point
-├── SFLV1_ResNet_CIFAR10_clustered_weighted.py
-│                                        # Weighted EMD + ORC entry point
-├── SplitFed_EMD_FedWaD.py            # FedWaD-only entry point
-├── FedWaD.py                          # FedWaD helper module
-├── 100clients_experiment_scripts/     # Versions used for 100-client runs
-├── analysis_scripts/                  # Distribution, EMD, clustering, and ORC tools
-├── 10_Clients_Results/                # 10-client plotting scripts/results layout
-├── 100_Clients_Results/               # 100-client plotting scripts/results layout
-├── run_sflv1.slurm                    # Example Nova/Slurm submission file
-└── data/                               # Local datasets; not stored in Git
+├── run.py                            # Unified experiment entry point
+├── config.yaml                       # Central YAML configuration and named presets
+├── config.py                         # Python config re-exports
+├── configs/
+│   ├── default_config.py             # ExperimentConfig dataclass & YAML loader
+│   └── smoke_test_config.py          # Fast CPU smoke-test configuration
+├── src/
+│   ├── core/                         # Standard FL Client, Server, and averaging utilities
+│   ├── data/                         # Dataset loaders and IID / Dirichlet partitioning
+│   ├── methods/
+│   │   └── tca.py                    # Transport-Curvature Aggregation (TCA)
+│   └── models/                       # Complete ResNet18, SmallCNN, and CharLSTM models
+├── scripts/
+│   ├── run_experiment.py             # Main FL training, evaluation, and CLI runner
+│   ├── run_phase2.sh                 # Multi-seed FedAvg + TCA experiment suite
+│   ├── run_phase2.slurm              # Slurm batch script for Phase 2 suite
+│   ├── summarize.py                  # Summarize results/*/round_metrics.csv
+│   ├── summarize_phase2.py           # Summarize multi-seed Phase 2 runs
+│   └── validate_tca_synthetic.py     # Standalone synthetic TCA validation check
+├── tests/
+│   ├── test_curvfed.py               # Unit tests for FL Client, Server, FedAvg, and config
+│   └── test_tca.py                   # Unit tests for TCA plans, curvature, and calibration
+├── results/                          # Experiment outputs (CSV, YAML, NPY, Excel)
+└── archive/                          # Archived research scripts and historical code
 ```
 
-Although several entry-point filenames contain `CIFAR10`, the current scripts read the dataset and model from `config.py`. Use only one of the supported dataset/model pairs listed above.
 
-## 1. Clone the repository
+## 1. Environment Setup
 
-The organized experiment code is on the `splitfed-experiments` branch:
-
-```bash
-git clone --branch splitfed-experiments --single-branch https://github.com/aaasif-isu/CurvFed.git
-cd CurvFed
-```
-
-## 2. Create a Python environment
-
-Python 3.10 or newer is recommended.
-
-### Linux or macOS
+Python 3.9+ is recommended.
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
+python -m pip install torch torchvision numpy pandas scipy scikit-learn pillow POT cvxpy pyyaml matplotlib openpyxl pytest
 ```
 
-### Windows PowerShell
 
-```powershell
-py -m venv .venv
-.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-```
+## 2. Configure and Run Experiments
 
-## 3. Install dependencies
+All experiments are driven through `config.yaml` and the unified entry point `run.py` (or `scripts/run_experiment.py`).
 
-Install PyTorch using the command appropriate for your operating system and CUDA version from the [official PyTorch installation page](https://pytorch.org/get-started/locally/). For a CPU-only installation, the following is sufficient:
+### Using `config.yaml` presets
+
+Select a named preset under `experiment:` in `config.yaml` (or set `experiment: "none"` to use the top-level keys directly):
+
+- `fedavg`: Standard sample-weighted FedAvg baseline
+- `tca_decoupled`: Decoupled TCA with update cost and hard marginal constraint
+- `tca_local`: Decoupled TCA with no marginal constraint and small `var_scale` ($10^{-6}$)
+- `tca_vs0.01`, `tca_vs0.1`, `tca_vs10`: Decoupled TCA across variance scales
+- `tca_feedback_uncal`: Feedback TCA without lazy curvature calibration
+- `tca_feedback_cal`: Feedback TCA with lazy curvature calibration (`calibrate: true`)
+- `debug`, `fedavg_debug`: Fast 2-round CPU smoke-test presets on MNIST + SmallCNN
+
+Run with the active `config.yaml`:
 
 ```bash
-python -m pip install torch torchvision
+python run.py
 ```
 
-Install the remaining packages:
+Or specify a custom YAML configuration file:
 
 ```bash
-python -m pip install numpy pandas scipy scikit-learn pillow POT networkx GraphRicciCurvature matplotlib openpyxl
+python run.py --config path/to/custom_config.yaml
 ```
 
-`POT` provides the Python module named `ot`. `GraphRicciCurvature` is required by the ORC methods.
+### Command-Line Overrides
 
-## 4. Configure an experiment
-
-Edit `config.py`. The most frequently changed values are:
-
-```python
-DATASET = "cifar10"       # cifar10, mnist, or shakespeare
-MODEL = "resnet18"        # resnet18 or charlstm
-NUM_USERS = 10             # 10 or 100
-ALPHA = 0.5                # 0.1, 0.5, 1.0, or 999999 for IID-like data
-SEED = 42
-GLOBAL_ROUNDS = 50
-LOCAL_EPOCHS = 1
-LEARNING_RATE = 0.0001
-FRAC = 1.0                 # 1.0 for 10 users; 0.1 for 100 users
-BATCH_SIZE = 256
-N_CLUSTERS = 3
-DISTANCE_METHOD = "fedwad" # emd or fedwad
-```
-
-Validate and display the configuration before starting a long run:
+Any configuration parameter can also be overridden from the command line:
 
 ```bash
-python config.py
+# Run FedAvg baseline
+python scripts/run_experiment.py --method fedavg --dataset cifar10 --model resnet18 --alpha 0.1 --rounds 50
+
+# Run Decoupled TCA (update cost, hard marginal)
+python scripts/run_experiment.py --method tca --tca-mode decoupled --tca-cost update --tca-marginal hard --tca-var-scale 1.0
+
+# Run Feedback TCA with lazy curvature calibration
+python scripts/run_experiment.py --method tca --tca-mode feedback --tca-cost update --tca-marginal hard --tca-calibrate 1 --tca-kappa-target auto
+
+# Fast CPU smoke test
+python scripts/run_experiment.py --smoke-test
 ```
 
-### Example: 10-client CIFAR-10
+### Multi-Seed Suite and Summaries
 
-```python
-DATASET = "cifar10"
-MODEL = "resnet18"
-NUM_USERS = 10
-FRAC = 1.0
-ALPHA = 0.5
-```
-
-### Example: 100-client CIFAR-10 with 10 active clients per round
-
-```python
-DATASET = "cifar10"
-MODEL = "resnet18"
-NUM_USERS = 100
-FRAC = 0.1
-ALPHA = 0.5
-```
-
-### Example: Shakespeare
-
-```python
-DATASET = "shakespeare"
-MODEL = "charlstm"
-NUM_USERS = 100
-FRAC = 0.1
-ALPHA = 0.5
-```
-
-## 5. Prepare the datasets
-
-### CIFAR-10 and MNIST
-
-The scripts use Torchvision and download CIFAR-10 or MNIST into `data/` when the dataset is not already present. The `data/` directory is intentionally excluded from Git.
-
-### Shakespeare
-
-The current implementation uses the **Tiny Shakespeare corpus from Karpathy's char-rnn repository**, followed by synthetic client partitioning. It is not the LEAF Shakespeare dataset with naturally separated speaking-role clients.
-
-The configured file path is:
-
-```text
-data/shakespeare/input.txt
-```
-
-If automatic download is unavailable, prepare it manually:
+To run the full multi-seed FedAvg and TCA comparison suite across Dirichlet $\alpha \in \{0.1, 0.5\}$:
 
 ```bash
-mkdir -p data/shakespeare
-curl -L https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt \
-  -o data/shakespeare/input.txt
+bash scripts/run_phase2.sh
 ```
 
-## 6. Run an aggregation method
-
-Run commands from the repository root. Change `config.py` before each experiment.
-
-| Method | Command |
-|---|---|
-| Baseline | `python -u SFLV1_ResNet_CIFAR10.py` |
-| EMD-only | `python -u SFLV1_ResNet_CIFAR10_EMD_only.py` |
-| EMD + ORC | `python -u SFLV1_ResNet_CIFAR10_clustered.py` |
-| Weighted EMD + ORC | `python -u SFLV1_ResNet_CIFAR10_clustered_weighted.py` |
-| FedWaD-only | `python -u SplitFed_EMD_FedWaD.py` |
-
-For exact reproduction of the previously reported 100-client runs, the corresponding scripts are also preserved in `100clients_experiment_scripts/`. Run them from the repository root so they can find `config.py`:
+To summarize completed runs:
 
 ```bash
-PYTHONPATH=. python -u 100clients_experiment_scripts/SFLV1_ResNet_CIFAR10.py
-PYTHONPATH=. python -u 100clients_experiment_scripts/SFLV1_ResNet_CIFAR10_EMD_only.py
-PYTHONPATH=. python -u 100clients_experiment_scripts/SFLV1_ResNet_CIFAR10_clustered.py
-PYTHONPATH=. python -u 100clients_experiment_scripts/SFLV1_ResNet_CIFAR10_clustered_weighted.py
-PYTHONPATH=. python -u 100clients_experiment_scripts/Splitfed_EMD_FedWaD.py
+python scripts/summarize.py --results-root results
+python scripts/summarize_phase2.py --results-root results/phase2
 ```
 
-Only one training command should be launched per allocated GPU unless the resource request and memory usage have been adjusted deliberately.
+## 3. Outputs and Result Formats
 
-## 7. Outputs
+Each experiment run writes its artifacts to `results/<run_name>/` (or `--output-dir`):
 
-Each training run writes an Excel workbook containing round-level accuracy and timing measurements. A typical filename is:
+- `resolved_config.yaml`: Full resolved `ExperimentConfig` used for the run
+- `round_metrics.csv`: Round-by-round global test accuracy/loss, personalized test accuracy (`personalized_mean_acc`, `personalized_min_acc`, and per-client `per_client_pers_acc` JSON), TCA curvature statistics (`kappa_min`, `kappa_mean`, `sparsity`, `inequality_violations`, `metric_violations`), contraction estimates (`q_half_raw`, `per_client_q`, `median_q`, `beta`), and round wall-clock time
+- `rounds/round_XXX.csv` and `rounds/A_round_XXX.npy`: Per-round metrics and TCA mixing matrices $A^{(t)}$
+- `client_label_histograms.csv` and `pairwise_label_tv_matrix.{csv,npy}`: Client label distributions and pairwise Total Variation distance matrix
+- `metrics_<experiment_tag>.xlsx`: Excel workbook of round metrics (when `save_excel: true`)
 
-```text
-SFLV1 resnet18 on cifar10 NonIID EMD ORC Weighted_alpha0.5_clients100_seed42.xlsx
-```
+## 4. Tests and Validation
 
-Depending on the method, the workbook contains columns such as:
-
-- `round`
-- `acc_train`
-- `acc_test` or `global_acc_test`
-- `round_time_sec`
-- `cumulative_time_sec`
-
-Methods that compute client relationships may also create experiment-specific directories containing smashed activations, distance matrices, cluster assignments, and readable round summaries. These generated artifacts can be large and should not be committed to Git.
-
-## 8. Organize and plot results
-
-Place one workbook for each method in the appropriate method directory under the dataset result folder. The expected method directory names are:
-
-```text
-Baseline/
-EMD/
-EMD+ORC/
-EMD+ORC_weighted/
-FedWaD/
-```
-
-For example, the 100-client CIFAR-10 results belong under:
-
-```text
-100_Clients_Results/Results_CIFAR10/
-```
-
-Then generate a comparison plot:
+Unit tests for standard FL training/aggregation, dataset partitioning, YAML configuration, and TCA components are located in `tests/`:
 
 ```bash
-python 100_Clients_Results/Results_CIFAR10/plot_results.py
+pytest tests/
 ```
 
-Other plotting commands are:
+A standalone synthetic check for 2-client TCA feedback contraction and lazy calibration is available in:
 
 ```bash
-python 10_Clients_Results/Results_CIFAR10/plot_results.py
-python 10_Clients_Results/Results_mnist/plot_result.py
-python 10_Clients_Results/Results_shakespeare/plot_result.py
-python 100_Clients_Results/Results_mnist/plot_results.py
-python 100_Clients_Results/Results_shakespeare/plot_results.py
+python scripts/validate_tca_synthetic.py
 ```
 
-Keep exactly one intended `.xlsx` workbook in each method directory when plotting; otherwise, verify which file the plotting script is selecting.
+## 5. Historical Results and Archive
 
-## 9. Run on the Iowa State Nova cluster
+Historical experiment workbooks, plotting scripts (`10_Clients_Results/`, `100_Clients_Results/`, `IID_Results_100_clients/`, `Old_Results/`), and archived research implementations (`archive/`, `analysis_scripts/`) are retained in the repository for reference.
 
-Activate the project environment and move to the repository root:
 
-```bash
-cd /lustre/hdd/LAS/jannesar-lab/neha2004/CurvFed/SplitFed-Neha_CNN_model_Training
-source activate curvfed_env
-```
-
-Before submission, edit `run_sflv1.slurm` to select the desired Python entry point and confirm that its account, partition, time, memory, CPU, and GPU directives match the current Nova allocation.
-
-Submit and monitor the job:
-
-```bash
-sbatch run_sflv1.slurm
-squeue -u "$USER"
-```
-
-After completion, inspect the Slurm output/error log and confirm that the expected Excel workbook was generated.
-
-## Reproducibility checklist
-
-Before comparing methods, keep these values identical across all runs:
-
-- dataset and model
-- number of users and active-client fraction
-- Dirichlet alpha
-- random seed
-- global rounds and local epochs
-- learning rate and batch size
-- train/test split and preprocessing
-
-For reliable conclusions, repeat each configuration with multiple seeds and report mean accuracy and standard deviation rather than relying on one final-round value.
-
-## Troubleshooting
-
-### A module cannot be imported
-
-Confirm that the virtual environment is active and install the missing dependency with `python -m pip install <package>`. Run scripts from the repository root. For scripts inside `100clients_experiment_scripts/`, use `PYTHONPATH=.` as shown above.
-
-### CUDA runs out of memory
-
-Reduce `BATCH_SIZE`, ensure another experiment is not using the same GPU, or request a GPU with more memory. Lowering the batch size changes the experimental configuration, so record the new value.
-
-### A 100-client experiment activates all clients
-
-Set both values correctly:
-
-```python
-NUM_USERS = 100
-FRAC = 0.1
-```
-
-### Shakespeare cannot find the text file
-
-Confirm that `data/shakespeare/input.txt` exists, or update `SHAKESPEARE_TEXT_PATH` in `config.py`.
-
-### The plot script cannot find a workbook
-
-Confirm that each method directory contains its completed `.xlsx` file and that the directory name matches the expected layout above.
-
-## Branches
-
-- `main`: original/default repository history
-- `splitfed-experiments`: organized active experiment code
-- `archive-previous-curvfed-code`: earlier CurvFed code retained for reference
-- `backup-pre-cleanup-2026-09-18`: safety snapshot before repository cleanup
-
-New experimental work should normally branch from `splitfed-experiments`.

@@ -1,17 +1,39 @@
-import os
+import copy
 import torch
+from torch import nn
 from torch.utils.data import DataLoader
 from ..data.partition import DatasetSplit
-from .train_utils import flatten_split_params
+from .train_utils import flatten_model_params
+
+
+def calculate_accuracy(logits: torch.Tensor, y: torch.Tensor) -> float:
+    preds = logits.max(1, keepdim=True)[1]
+    correct = preds.eq(y.view_as(preds)).sum().item()
+    return 100.0 * correct / max(1, logits.shape[0])
 
 
 class Client:
-    def __init__(self, idx, lr, device, batch_size, local_ep, dataset_train, dataset_test, idxs, idxs_test):
-        self.idx = idx
+    """Standard Federated Learning client that trains a complete neural network locally."""
+
+    def __init__(
+        self,
+        idx,
+        lr,
+        device,
+        batch_size,
+        local_ep,
+        dataset_train,
+        dataset_test=None,
+        idxs=None,
+        idxs_test=None,
+    ):
+        self.idx = int(idx)
         self.device = device
         self.lr = lr
         self.local_ep = local_ep
         self.mid_param_vec = None
+        self.train_loss = 0.0
+        self.train_acc = 0.0
         client_batch_size = min(batch_size, max(1, len(idxs)))
         self.ldr_train = DataLoader(
             DatasetSplit(dataset_train, idxs),
@@ -19,73 +41,77 @@ class Client:
             shuffle=True,
             drop_last=len(idxs) >= client_batch_size,
         )
-        self.ldr_test = DataLoader(
-            DatasetSplit(dataset_test, idxs_test),
-            batch_size=batch_size,
-            shuffle=False,
+        self.ldr_test = (
+            DataLoader(
+                DatasetSplit(dataset_test, idxs_test),
+                batch_size=batch_size,
+                shuffle=False,
+            )
+            if dataset_test is not None and idxs_test is not None
+            else None
         )
 
-    def train(self, net, server, iter_epoch, smashed_dir=None, model_name=None):
+    def train(self, net: nn.Module) -> dict:
         net.train()
-        optimizer_client = torch.optim.Adam(net.parameters(), lr=self.lr)
+        optimizer = torch.optim.Adam(net.parameters(), lr=self.lr)
+        criterion = nn.CrossEntropyLoss()
+
         total_steps = self.local_ep * len(self.ldr_train)
         mid_step = max(1, total_steps // 2)
         step_count = 0
         self.mid_param_vec = None
 
-        for iter_local in range(self.local_ep):
-            len_batch = len(self.ldr_train)
-            for batch_idx, (images, labels) in enumerate(self.ldr_train):
+        epoch_losses = []
+        epoch_accs = []
+
+        for _ in range(self.local_ep):
+            batch_losses = []
+            batch_accs = []
+            for images, labels in self.ldr_train:
                 images, labels = images.to(self.device), labels.to(self.device)
-                optimizer_client.zero_grad()
+                optimizer.zero_grad()
 
-                fx = net(images)
-                client_fx = fx.clone().detach().requires_grad_(True)
+                logits = net(images)
+                loss = criterion(logits, labels)
+                loss.backward()
+                optimizer.step()
 
-                if smashed_dir is not None and iter_local == self.local_ep - 1:
-                    with torch.no_grad():
-                        _fx = fx.detach().cpu()
-                        if model_name == "charlstm" and _fx.dim() == 3:
-                            _fx = _fx[:, -1, :]
-                        else:
-                            _fx = _fx.reshape(_fx.size(0), -1)
-                        should_save = (model_name != "charlstm") or (batch_idx == 0)
-                        if should_save:
-                            os.makedirs(smashed_dir, exist_ok=True)
-                            torch.save(
-                                _fx,
-                                os.path.join(
-                                    smashed_dir,
-                                    f"client_{self.idx}_batch_{batch_idx:04d}.pt",
-                                ),
-                            )
-                            torch.save(
-                                labels.detach().cpu().long(),
-                                os.path.join(
-                                    smashed_dir,
-                                    f"labels_{self.idx}_batch_{batch_idx:04d}.pt",
-                                ),
-                            )
-
-                dfx = server.train_step(client_fx, labels, iter_local, self.local_ep, self.idx, len_batch)
-
-                fx.backward(dfx)
-                optimizer_client.step()
+                batch_losses.append(float(loss.item()))
+                batch_accs.append(calculate_accuracy(logits, labels))
 
                 step_count += 1
                 if step_count == mid_step:
-                    self.mid_param_vec = flatten_split_params(net, server.models[self.idx])
+                    self.mid_param_vec = flatten_model_params(net)
+
+            if batch_losses:
+                epoch_losses.append(sum(batch_losses) / len(batch_losses))
+                epoch_accs.append(sum(batch_accs) / len(batch_accs))
 
         if self.mid_param_vec is None:
-            self.mid_param_vec = flatten_split_params(net, server.models[self.idx])
+            self.mid_param_vec = flatten_model_params(net)
 
-        return net.state_dict()
+        self.train_loss = epoch_losses[-1] if epoch_losses else 0.0
+        self.train_acc = epoch_accs[-1] if epoch_accs else 0.0
+        return copy.deepcopy(net.state_dict())
 
-    def evaluate(self, net, server, iter_epoch):
+    def evaluate(self, net: nn.Module):
+        if self.ldr_test is None:
+            return 0.0, 0.0
         net.eval()
+        criterion = nn.CrossEntropyLoss()
+        total_loss = 0.0
+        correct = 0
+        total = 0
         with torch.no_grad():
-            len_batch = len(self.ldr_test)
-            for batch_idx, (images, labels) in enumerate(self.ldr_test):
+            for images, labels in self.ldr_test:
                 images, labels = images.to(self.device), labels.to(self.device)
-                fx = net(images)
-                server.evaluate_step(fx, labels, self.idx, len_batch)
+                logits = net(images)
+                loss = criterion(logits, labels)
+                total_loss += float(loss.item()) * labels.size(0)
+                preds = logits.max(1, keepdim=True)[1]
+                correct += int(preds.eq(labels.view_as(preds)).sum().item())
+                total += int(labels.size(0))
+        if total == 0:
+            return 0.0, 0.0
+        return 100.0 * correct / total, total_loss / total
+

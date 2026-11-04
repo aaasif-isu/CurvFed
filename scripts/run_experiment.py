@@ -32,7 +32,7 @@ from configs.default_config import (
 )
 from src.core.client import Client
 from src.core.server import Server
-from src.core.train_utils import FedAvg, clusterwise_fedavg, weighted_average
+from src.core.train_utils import FedAvg, flatten_model_params, weighted_average
 from src.data.dataset import load_configured_datasets
 from src.data.partition import (
     DatasetSplit,
@@ -40,29 +40,19 @@ from src.data.partition import (
     partition_client_indices,
     partition_personalized_test_indices,
 )
-from src.methods.curvfed_agg import (
-    apply_cluster_mode,
-    build_distrib_for_round,
-    cluster_clients_from_emd,
-    cluster_clients_from_ricci,
-    compute_cluster_ari,
-    compute_emd_for_round,
-    compute_emd_noise_floor,
-    compute_fedwad_for_round,
-    compute_ricci_for_round,
-    make_round_dirs,
-)
 from src.methods.tca import (
     build_cost_matrix,
     build_variance_vector,
     estimate_q,
-    flatten_split_params,
     lazy_calibrate,
     plan_curvature,
     solve_tca_plan,
-    tca_aggregate_split_models,
+    tca_aggregate_models,
 )
 from src.models import build_model
+
+
+
 
 
 def set_seed(seed: int) -> None:
@@ -119,24 +109,15 @@ def _module_param_l2_norm(module: torch.nn.Module) -> float:
     return float(np.sqrt(sq_sum))
 
 
-def _split_pair_l2_norms(client_net: torch.nn.Module, server_net: torch.nn.Module):
-    c_norm = _module_param_l2_norm(client_net)
-    s_norm = _module_param_l2_norm(server_net)
-    total_norm = float(np.hypot(c_norm, s_norm))
-    return total_norm, c_norm, s_norm
-
-
-def _evaluate_split_pair(
-    client_net: torch.nn.Module,
-    server_net: torch.nn.Module,
+def _evaluate_model(
+    model: torch.nn.Module,
     dataset,
     batch_size: int,
     device: torch.device,
     num_classes: Optional[int] = None,
     return_pred_hist: bool = False,
 ):
-    client_net.eval()
-    server_net.eval()
+    model.eval()
     correct, total, total_loss = 0, 0, 0.0
     pred_list: List[np.ndarray] = []
     inferred_classes: Optional[int] = num_classes
@@ -145,13 +126,12 @@ def _evaluate_split_pair(
     with torch.no_grad():
         for images, labels in loader:
             images, labels = images.to(device), labels.to(device)
-            fx_client = client_net(images)
-            fx_server = server_net(fx_client)
+            logits = model(images)
             if inferred_classes is None:
-                inferred_classes = int(fx_server.size(1))
-            loss = criterion(fx_server, labels)
+                inferred_classes = int(logits.size(1))
+            loss = criterion(logits, labels)
             total_loss += loss.item() * labels.size(0)
-            preds = fx_server.max(1, keepdim=True)[1]
+            preds = logits.max(1, keepdim=True)[1]
             correct += preds.eq(labels.view_as(preds)).sum().item()
             total += labels.size(0)
             if return_pred_hist:
@@ -172,26 +152,21 @@ def _canonicalize_method(method: str) -> str:
     m = method.strip().lower()
     if m == "fedavg":
         return "baseline"
-    if m == "curvfed":
-        return "emd_orc"
     return m
 
 
 def run_experiment(
     config: ExperimentConfig = CONFIG,
     method: Optional[str] = None,
-    run_noise_floor: Optional[bool] = None,
     save_excel: Optional[bool] = None,
     output_dir: Optional[str] = None,
 ):
     raw_method = (method or config.method or "baseline").strip().lower()
     canonical_method = _canonicalize_method(raw_method)
-    if canonical_method not in ("baseline", "emd_only", "emd_orc", "emd_orc_weighted", "fedwad", "tca"):
+    if canonical_method not in ("baseline", "tca"):
         raise ValueError(f"Unsupported method: {raw_method}")
     method = canonical_method
 
-    if run_noise_floor is None:
-        run_noise_floor = config.run_noise_floor
     if save_excel is None:
         save_excel = config.save_excel
     resolved_output_dir = output_dir or config.output_dir
@@ -213,7 +188,6 @@ def run_experiment(
         config,
         experiment=exp_name,
         method=method,
-        run_noise_floor=bool(run_noise_floor),
         save_excel=bool(save_excel),
         output_dir=out_folder,
     )
@@ -226,12 +200,12 @@ def run_experiment(
         f"(model={config.model}, dataset={config.dataset}, "
         f"clients={config.num_users}, frac={config.frac}, alpha={config.alpha}, "
         f"rounds={config.global_rounds}, lr={config.learning_rate:g}, batch_size={config.batch_size}, "
-        f"cluster_mode={config.cluster_mode}, "
-        f"zscore_mode={config.zscore_mode}, consistent_split={config.consistent_split_weights}, "
         f"tca_mode={config.tca_mode}, tca_cost={config.tca_cost}, "
         f"tca_marginal={config.tca_marginal}, tca_var_scale={config.tca_var_scale:g}, "
         f"tca_calibrate={config.tca_calibrate})"
     )
+
+
 
     dataset_train, dataset_test, train_labels, test_labels = load_configured_datasets(config)
     dict_users = partition_client_indices(config, dataset_train, train_labels)
@@ -275,35 +249,19 @@ def run_experiment(
             f"class_counts={test_cls_counts.tolist()}"
         )
 
-    client_model, server_model = build_model(config)
+    base_model = build_model(config)
     if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-        client_model = torch.nn.DataParallel(client_model)
-        server_model = torch.nn.DataParallel(server_model)
-    client_model = client_model.to(device)
-    server_model = server_model.to(device)
+        base_model = torch.nn.DataParallel(base_model)
+    base_model = base_model.to(device)
 
     server = Server(
-        models={i: server_model for i in range(config.num_users)},
+        global_model=base_model,
         device=device,
-        lr=config.learning_rate,
         num_users=config.num_users,
-        global_model=copy.deepcopy(server_model).to(device),
     )
 
-    w_glob_client = copy.deepcopy(client_model.state_dict())
-    w_glob_server = copy.deepcopy(server.global_model.state_dict())
-    pers_client_states: Dict[int, dict] = {
-        i: copy.deepcopy(w_glob_client) for i in range(config.num_users)
-    }
-    pers_server_states: Dict[int, dict] = {
-        i: copy.deepcopy(w_glob_server) for i in range(config.num_users)
-    }
-
     # --- Round 0 evaluation before any training ---
-    client_model.load_state_dict(w_glob_client)
-    server.global_model.load_state_dict(w_glob_server)
-    r0_glob_acc, r0_glob_loss, r0_pred_hist = _evaluate_split_pair(
-        client_model,
+    r0_glob_acc, r0_glob_loss, r0_pred_hist = _evaluate_model(
         server.global_model,
         eval_test_dataset,
         config.batch_size,
@@ -311,36 +269,29 @@ def run_experiment(
         num_classes=config.num_classes,
         return_pred_hist=True,
     )
-    r0_glob_tot_norm, r0_glob_c_norm, r0_glob_s_norm = _split_pair_l2_norms(
-        client_model, server.global_model
-    )
-    r0_eval_c = copy.deepcopy(client_model).to(device)
-    r0_eval_s = copy.deepcopy(server.global_model).to(device)
+    r0_glob_norm = _module_param_l2_norm(server.global_model)
+    r0_eval_net = copy.deepcopy(server.global_model).to(device)
     r0_pers_accs = []
     r0_pers_log_items = []
     r0_pers_norm_items = []
     for idx_int in range(config.num_users):
-        r0_eval_c.load_state_dict(pers_client_states[idx_int])
-        r0_eval_s.load_state_dict(pers_server_states[idx_int])
+        r0_eval_net.load_state_dict(server.personalized_states[idx_int])
         split_ds = pers_test_datasets[idx_int]
         split_n = len(split_ds)
-        c_acc, _ = _evaluate_split_pair(
-            r0_eval_c, r0_eval_s, split_ds, config.batch_size, device
+        c_acc, _ = _evaluate_model(
+            r0_eval_net, split_ds, config.batch_size, device
         )
-        p_tot, p_c, p_s = _split_pair_l2_norms(r0_eval_c, r0_eval_s)
+        p_norm = _module_param_l2_norm(r0_eval_net)
         r0_pers_accs.append(float(c_acc))
         r0_pers_log_items.append(f"c{idx_int}: {c_acc:.2f}% (n={split_n})")
-        r0_pers_norm_items.append(f"c{idx_int}: {p_tot:.4f} (c={p_c:.4f}, s={p_s:.4f})")
+        r0_pers_norm_items.append(f"c{idx_int}: {p_norm:.4f}")
     r0_pers_mean = float(np.mean(r0_pers_accs)) if r0_pers_accs else 0.0
     r0_pers_min = float(np.min(r0_pers_accs)) if r0_pers_accs else 0.0
     print(
         f"Round 0/{config.global_rounds} (Init) | Global Acc: {r0_glob_acc:.2f}% | "
         f"Global Loss: {r0_glob_loss:.4f} | Pers Mean/Min: {r0_pers_mean:.2f}%/{r0_pers_min:.2f}%"
     )
-    print(
-        f"  [Round 0] Global Param L2 Norm: total={r0_glob_tot_norm:.4f}, "
-        f"client_half={r0_glob_c_norm:.4f}, server_half={r0_glob_s_norm:.4f}"
-    )
+    print(f"  [Round 0] Global Param L2 Norm: total={r0_glob_norm:.4f}")
     print(f"  [Round 0] Global Test Pred Histogram ({len(r0_pred_hist)} classes): {r0_pred_hist}")
     print(f"  [Round 0] Per-client Pers Acc (held-out split): " + " | ".join(r0_pers_log_items))
     print(f"  [Round 0] Per-client Pers Param L2 Norm: " + " | ".join(r0_pers_norm_items))
@@ -350,14 +301,11 @@ def run_experiment(
         "global_loss_test": [],
         "personalized_mean_acc": [],
         "personalized_min_acc": [],
-        "ari_prev_round": [],
         "round_time_sec": [],
-        "noise_floor": [],
         "round_rows": [],
     }
-    exp_work_dir = os.path.join(out_folder, "work")
-    prev_cluster_groups: Optional[Dict[int, List[int]]] = None
-    
+
+
     for round_idx in range(config.global_rounds):
         round_start_time = time.perf_counter()
 
@@ -365,20 +313,7 @@ def run_experiment(
         active_users = rng.choice(range(config.num_users), config.num_active_clients, replace=False)
         active_users = np.array(sorted(int(x) for x in active_users), dtype=np.int64)
 
-        need_emd = (
-            method in ("emd_only", "emd_orc", "emd_orc_weighted", "fedwad")
-            or (method == "tca" and config.tca_cost == "emd")
-        )
-        use_smashed = need_emd or run_noise_floor or config.smoke_test
-        if use_smashed:
-            smashed_dir, out_dir, distrib_dir = make_round_dirs(round_idx, experiment_root=exp_work_dir)
-        else:
-            smashed_dir, out_dir, distrib_dir = None, None, None
-
-        w_locals_client = []
-        w_locals_server = []
-        client_weights_by_id = {}
-        server_weights_by_id = {}
+        w_locals: List[dict] = []
         active_sample_counts: List[int] = []
         active_deltas: List[np.ndarray] = []
         norm_v1_list: List[float] = []
@@ -398,24 +333,16 @@ def run_experiment(
                 idxs_test=dict_users_test[idx_int],
             )
 
-            net = copy.deepcopy(client_model).to(device)
-            if method == "tca" and config.tca_mode == "feedback":
-                net.load_state_dict(pers_client_states[idx_int])
-                server.models[idx_int].load_state_dict(pers_server_states[idx_int])
-            else:
-                net.load_state_dict(w_glob_client)
-                server.models[idx_int].load_state_dict(w_glob_server)
-
-            start_vec = flatten_split_params(net, server.models[idx_int])
-            w_client = local.train(
-                net,
-                server,
-                iter_epoch=round_idx,
-                smashed_dir=smashed_dir,
-                model_name=config.model,
+            net = copy.deepcopy(server.global_model).to(device)
+            init_state = server.get_client_init_state(
+                idx_int, method=method, tca_mode=config.tca_mode
             )
+            net.load_state_dict(init_state)
+
+            start_vec = flatten_model_params(net)
+            w_client = local.train(net)
             mid_vec = local.mid_param_vec if local.mid_param_vec is not None else start_vec
-            end_vec = flatten_split_params(net, server.models[idx_int])
+            end_vec = flatten_model_params(net)
 
             v1 = mid_vec - start_vec
             v2 = end_vec - mid_vec
@@ -424,50 +351,12 @@ def run_experiment(
             active_deltas.append(end_vec - start_vec)
             active_sample_counts.append(len(dict_users[idx_int]))
 
-            w_client_copy = copy.deepcopy(w_client)
-            w_locals_client.append(w_client_copy)
-            client_weights_by_id[idx_int] = w_client_copy
-
-            w_server = copy.deepcopy(server.models[idx_int].state_dict())
-            w_locals_server.append(w_server)
-            server_weights_by_id[idx_int] = w_server
+            w_locals.append(copy.deepcopy(w_client))
 
         q_arr, median_q, q_half_raw_arr = estimate_q(norm_v1_list, norm_v2_list, return_raw=True)
         per_client_q = {int(cid): float(qv) for cid, qv in zip(active_users, q_arr)}
         q_half_raw = {int(cid): float(rv) for cid, rv in zip(active_users, q_half_raw_arr)}
 
-        nf_stats = None
-        fedwad_dist = None
-        emd = None
-        if use_smashed:
-            matrix_client_ids = build_distrib_for_round(
-                smashed_dir, distrib_dir, seed=config.seed, cleanup_smashed=True
-            )
-            emd = compute_emd_for_round(distrib_dir, out_dir, zscore_mode=config.zscore_mode)
-            if method == "fedwad" and config.distance_method == "fedwad":
-                fedwad_dist = compute_fedwad_for_round(
-                    distrib_dir,
-                    out_dir=out_dir,
-                    zscore_mode=config.zscore_mode,
-                    seed=config.seed + round_idx,
-                    n_supp=config.fedwad_n_supp,
-                    n_epoch=config.fedwad_epochs,
-                    t_val=config.fedwad_t,
-                )
-            if run_noise_floor or config.smoke_test:
-                nf_stats = compute_emd_noise_floor(
-                    distrib_dir,
-                    emd_matrix=emd,
-                    seed=config.seed + round_idx,
-                    zscore_mode=config.zscore_mode,
-                )
-                metrics["noise_floor"].append(nf_stats)
-            if distrib_dir and os.path.exists(distrib_dir):
-                shutil.rmtree(distrib_dir, ignore_errors=True)
-
-        cluster_groups: Dict[int, List[int]] = {0: [int(u) for u in active_users]}
-        cluster_models_server = None
-        cluster_models_client = None
         kappa_min = float("nan")
         kappa_mean = float("nan")
         sparsity = float("nan")
@@ -475,16 +364,15 @@ def run_experiment(
         metric_violations = float("nan")
         beta_val = float("nan")
 
+
+
         if method == "baseline":
-            rho = np.asarray(active_sample_counts, dtype=np.float64)
-            rho = rho / max(float(rho.sum()), 1e-12)
-            w_glob_server = weighted_average(w_locals_server, rho)
-            w_glob_client = weighted_average(w_locals_client, rho)
+            server.aggregate_fedavg(w_locals, active_sample_counts)
         elif method == "tca":
             rho = np.asarray(active_sample_counts, dtype=np.float64)
             rho = rho / max(float(rho.sum()), 1e-12)
             v_vec = build_variance_vector(active_sample_counts, var_scale=config.tca_var_scale)
-            D_norm = build_cost_matrix(config.tca_cost, deltas=active_deltas, emd_matrix=emd)
+            D_norm = build_cost_matrix(config.tca_cost, deltas=active_deltas)
             C = D_norm ** 2
             A_plan = solve_tca_plan(
                 C,
@@ -520,74 +408,15 @@ def run_experiment(
                 )
                 print(f"  [Round {round_idx + 1}] Plan matrix A (shape={A_plan.shape}):\n{a_str}")
 
-            (
-                w_glob_client,
-                w_glob_server,
-                active_pers_client,
-                active_pers_server,
-            ) = tca_aggregate_split_models(
-                w_locals_client,
-                w_locals_server,
+            w_glob, active_pers = tca_aggregate_models(
+                w_locals,
                 A_plan,
                 rho,
                 [int(u) for u in active_users],
             )
-            for cid_int in [int(u) for u in active_users]:
-                pers_client_states[cid_int] = copy.deepcopy(active_pers_client[cid_int])
-                pers_server_states[cid_int] = copy.deepcopy(active_pers_server[cid_int])
-        else:
-            if method == "emd_only":
-                _, raw_groups = cluster_clients_from_emd(
-                    emd, out_dir=out_dir, n_clusters=config.n_clusters, client_ids=matrix_client_ids
-                )
-            elif method == "fedwad":
-                dist_mat = fedwad_dist if fedwad_dist is not None else emd
-                _, raw_groups = cluster_clients_from_emd(
-                    dist_mat, out_dir=out_dir, n_clusters=config.n_clusters, client_ids=matrix_client_ids
-                )
-            else:
-                ricci_graph = compute_ricci_for_round(emd, out_dir=out_dir)
-                _, raw_groups = cluster_clients_from_ricci(
-                    ricci_graph,
-                    out_dir=out_dir,
-                    n_clusters=config.n_clusters,
-                    client_ids=matrix_client_ids,
-                )
+            server.update_from_tca(w_glob, active_pers)
 
-            cluster_groups = apply_cluster_mode(
-                raw_groups,
-                cluster_mode=config.cluster_mode,
-                seed=config.seed + 10000 + round_idx,
-            )
-            print(
-                f"Round {round_idx + 1} ({method.upper()}, mode={config.cluster_mode}) "
-                f"cluster groups: {cluster_groups}"
-            )
-            weight_users = dict_users if method == "emd_orc_weighted" else None
-            w_glob_server, cluster_models_server = clusterwise_fedavg(
-                server_weights_by_id, cluster_groups, dict_users=weight_users
-            )
-            if config.consistent_split_weights:
-                w_glob_client, cluster_models_client = clusterwise_fedavg(
-                    client_weights_by_id, cluster_groups, dict_users=weight_users
-                )
-            else:
-                w_glob_client = FedAvg(w_locals_client)
-
-        ari_prev = compute_cluster_ari(prev_cluster_groups, cluster_groups)
-        prev_cluster_groups = copy.deepcopy(cluster_groups)
-        metrics["ari_prev_round"].append(ari_prev)
-
-        client_model.load_state_dict(w_glob_client)
-        server.global_model.load_state_dict(w_glob_server)
-        for i in range(config.num_users):
-            if method == "tca" and config.tca_mode == "feedback":
-                server.models[i].load_state_dict(pers_server_states[i])
-            else:
-                server.models[i].load_state_dict(w_glob_server)
-
-        global_acc, global_loss, global_pred_hist = _evaluate_split_pair(
-            client_model,
+        global_acc, global_loss, global_pred_hist = _evaluate_model(
             server.global_model,
             eval_test_dataset,
             config.batch_size,
@@ -595,24 +424,15 @@ def run_experiment(
             num_classes=config.num_classes,
             return_pred_hist=True,
         )
-        glob_tot_norm, glob_c_norm, glob_s_norm = _split_pair_l2_norms(
-            client_model, server.global_model
-        )
+        glob_tot_norm = _module_param_l2_norm(server.global_model)
 
-        sorted_cluster_keys = sorted(k for k, v in cluster_groups.items() if len(v) > 0)
-        client_to_cluster_pos = {}
-        for pos, ck in enumerate(sorted_cluster_keys):
-            for cid in cluster_groups[ck]:
-                client_to_cluster_pos[int(cid)] = pos
 
         pers_client_accs = []
         pers_client_log_items = []
         pers_client_norm_items = []
         per_client_pers_acc_map = {}
         per_client_test_size_map = {}
-        per_client_norm_map = {}
-        eval_c_net = copy.deepcopy(client_model).to(device)
-        eval_s_net = copy.deepcopy(server.global_model).to(device)
+        eval_net = copy.deepcopy(server.global_model).to(device)
         eval_client_ids = (
             list(range(config.num_users))
             if method == "tca"
@@ -620,42 +440,23 @@ def run_experiment(
         )
         for idx_int in eval_client_ids:
             if method == "tca":
-                eval_c_net.load_state_dict(pers_client_states[idx_int])
-                eval_s_net.load_state_dict(pers_server_states[idx_int])
-            elif cluster_models_server is not None and idx_int in client_to_cluster_pos:
-                pos = client_to_cluster_pos[idx_int]
-                eval_s_net.load_state_dict(cluster_models_server[pos])
-                if cluster_models_client is not None:
-                    eval_c_net.load_state_dict(cluster_models_client[pos])
-                else:
-                    eval_c_net.load_state_dict(w_glob_client)
+                eval_net.load_state_dict(server.personalized_states[idx_int])
             else:
-                eval_c_net.load_state_dict(w_glob_client)
-                eval_s_net.load_state_dict(w_glob_server)
+                eval_net.load_state_dict(server.global_state)
 
             split_ds = pers_test_datasets[idx_int]
             split_n = len(split_ds)
-            c_acc, _ = _evaluate_split_pair(
-                eval_c_net, eval_s_net, split_ds, config.batch_size, device
+            c_acc, _ = _evaluate_model(
+                eval_net, split_ds, config.batch_size, device
             )
-            p_tot_norm, p_c_norm, p_s_norm = _split_pair_l2_norms(eval_c_net, eval_s_net)
+            p_tot_norm = _module_param_l2_norm(eval_net)
             pers_client_accs.append(float(c_acc))
             per_client_pers_acc_map[idx_int] = float(c_acc)
             per_client_test_size_map[idx_int] = int(split_n)
-            per_client_norm_map[idx_int] = {
-                "total": float(p_tot_norm),
-                "client_half": float(p_c_norm),
-                "server_half": float(p_s_norm),
-            }
             pers_client_log_items.append(f"c{idx_int}: {c_acc:.2f}% (n={split_n})")
-            pers_client_norm_items.append(
-                f"c{idx_int}: {p_tot_norm:.4f} (c={p_c_norm:.4f}, s={p_s_norm:.4f})"
-            )
+            pers_client_norm_items.append(f"c{idx_int}: {p_tot_norm:.4f}")
 
-        print(
-            f"  [Round {round_idx + 1}] Global Param L2 Norm: total={glob_tot_norm:.4f}, "
-            f"client_half={glob_c_norm:.4f}, server_half={glob_s_norm:.4f}"
-        )
+        print(f"  [Round {round_idx + 1}] Global Param L2 Norm: total={glob_tot_norm:.4f}")
         print(
             f"  [Round {round_idx + 1}] Global Test Pred Histogram ({len(global_pred_hist)} classes): "
             f"{global_pred_hist}"
@@ -673,13 +474,9 @@ def run_experiment(
         pers_min_acc = float(np.min(pers_client_accs)) if pers_client_accs else 0.0
         round_time = time.perf_counter() - round_start_time
 
-        cluster_sizes = {int(k): len(v) for k, v in sorted(cluster_groups.items())}
         round_row = {
             "method": method,
             "config": config.experiment_tag,
-            "zscore_mode": config.zscore_mode,
-            "cluster_mode": config.cluster_mode,
-            "consistent_split_weights": config.consistent_split_weights,
             "tca_mode": config.tca_mode if method == "tca" else "N/A",
             "tca_cost": config.tca_cost if method == "tca" else "N/A",
             "tca_marginal": config.tca_marginal if method == "tca" else "N/A",
@@ -688,14 +485,6 @@ def run_experiment(
             "round": round_idx + 1,
             "global_acc_test": global_acc,
             "global_loss_test": global_loss,
-            "cluster_assignments": json.dumps(cluster_groups),
-            "cluster_sizes": json.dumps(cluster_sizes),
-            "ari_prev_round": ari_prev,
-            "within_emd_mean": nf_stats["within_mean"] if nf_stats else float("nan"),
-            "within_emd_std": nf_stats["within_std"] if nf_stats else float("nan"),
-            "cross_emd_mean": nf_stats["cross_mean"] if nf_stats else float("nan"),
-            "cross_emd_std": nf_stats["cross_std"] if nf_stats else float("nan"),
-            "emd_snr": nf_stats["snr"] if nf_stats else float("nan"),
             "personalized_mean_acc": pers_mean_acc,
             "personalized_min_acc": pers_min_acc,
             "per_client_pers_acc": json.dumps(per_client_pers_acc_map),
@@ -731,12 +520,9 @@ def run_experiment(
         print(
             f"Round {round_idx + 1}/{config.global_rounds} | "
             f"Method: {method.upper()} | Global Acc: {global_acc:.2f}% | "
-            f"Pers Mean/Min: {pers_mean_acc:.2f}%/{pers_min_acc:.2f}% | "
-            f"ARI: {ari_prev:.3f}{tca_info} | Time: {round_time:.2f}s"
+            f"Pers Mean/Min: {pers_mean_acc:.2f}%/{pers_min_acc:.2f}%{tca_info} | "
+            f"Time: {round_time:.2f}s"
         )
-
-    if os.path.exists(exp_work_dir):
-        shutil.rmtree(exp_work_dir, ignore_errors=True)
 
     full_df = pd.DataFrame(metrics["round_rows"])
     full_df.to_csv(os.path.join(out_folder, "round_metrics.csv"), index=False)
@@ -746,12 +532,13 @@ def run_experiment(
         )
 
     print(f"Training finished. Results written to: {out_folder}")
-    return metrics, client_model, server.global_model
+    return metrics, server.global_model
+
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run CurvFed SplitFed experiment (reads config.yaml by default)."
+        description="Run CurvFed Federated Learning experiment (reads config.yaml by default)."
     )
     parser.add_argument(
         "--config",
@@ -767,34 +554,13 @@ def main():
         choices=[
             "baseline",
             "fedavg",
-            "emd_only",
-            "emd_orc",
-            "curvfed",
-            "emd_orc_weighted",
-            "fedwad",
             "tca",
         ],
         help="Aggregation method to run (overrides 'method' in YAML).",
     )
     parser.add_argument("--smoke-test", action="store_true", help="Use CPU smoke-test config.")
-    parser.add_argument(
-        "--noise-floor",
-        dest="noise_floor",
-        action="store_true",
-        default=None,
-        help="Enable Sanity Check A (within/cross EMD SNR).",
-    )
-    parser.add_argument(
-        "--no-noise-floor",
-        dest="noise_floor",
-        action="store_false",
-        help="Disable Sanity Check A.",
-    )
-    parser.add_argument("--cluster-mode", type=str, default=None, choices=["geometry", "random"])
-    parser.add_argument("--zscore-mode", type=str, default=None, choices=["per_client", "pooled", "none"])
-    parser.add_argument("--consistent-split-weights", type=int, default=None, choices=[0, 1])
     parser.add_argument("--tca-mode", type=str, default=None, choices=["decoupled", "feedback"])
-    parser.add_argument("--tca-cost", type=str, default=None, choices=["update", "emd"])
+    parser.add_argument("--tca-cost", type=str, default=None, choices=["update"])
     parser.add_argument("--tca-marginal", type=str, default=None, choices=["hard", "unbalanced", "none"])
     parser.add_argument("--tca-calibrate", type=int, default=None, choices=[0, 1])
     parser.add_argument("--tca-kappa-target", type=str, default=None)
@@ -805,7 +571,6 @@ def main():
     parser.add_argument("--model", type=str, default=None, choices=["resnet18", "smallcnn", "charlstm"])
     parser.add_argument("--num-users", type=int, default=None)
     parser.add_argument("--frac", type=float, default=None)
-    parser.add_argument("--n-clusters", type=int, default=None)
     parser.add_argument("--alpha", type=float, default=None)
     parser.add_argument("--rounds", type=int, default=None)
     parser.add_argument("--local-epochs", type=int, default=None)
@@ -825,14 +590,6 @@ def main():
     overrides = {}
     if args.method is not None:
         overrides["method"] = args.method
-    if args.noise_floor is not None:
-        overrides["run_noise_floor"] = bool(args.noise_floor)
-    if args.cluster_mode is not None:
-        overrides["cluster_mode"] = args.cluster_mode
-    if args.zscore_mode is not None:
-        overrides["zscore_mode"] = args.zscore_mode
-    if args.consistent_split_weights is not None:
-        overrides["consistent_split_weights"] = bool(args.consistent_split_weights)
     if args.tca_mode is not None:
         overrides["tca_mode"] = args.tca_mode
     if args.tca_cost is not None:
@@ -858,8 +615,6 @@ def main():
         overrides["num_users"] = args.num_users
     if args.frac is not None:
         overrides["frac"] = args.frac
-    if args.n_clusters is not None:
-        overrides["n_clusters"] = args.n_clusters
     if args.alpha is not None:
         overrides["alpha"] = args.alpha
     if args.rounds is not None:
@@ -882,10 +637,10 @@ def main():
     run_experiment(
         config=cfg,
         method=cfg.method,
-        run_noise_floor=cfg.run_noise_floor or cfg.smoke_test,
         save_excel=cfg.save_excel,
         output_dir=cfg.output_dir,
     )
+
 
 
 if __name__ == "__main__":

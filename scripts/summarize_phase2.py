@@ -10,13 +10,13 @@ import pandas as pd
 
 RUN_ORDER = [
     "fedavg",
-    "curvfed",
     "tca_decoupled_update_hard",
     "tca_decoupled_update_none",
-    "tca_decoupled_emd_hard",
     "tca_feedback_uncalibrated",
     "tca_feedback_calibrated",
 ]
+
+
 
 
 def _load_run_df(run_dir: str) -> pd.DataFrame:

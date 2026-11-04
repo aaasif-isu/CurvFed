@@ -9,7 +9,8 @@ import ot
 import torch
 from scipy.spatial.distance import pdist, squareform
 
-from ..core.train_utils import flatten_split_params, weighted_average
+from ..core.train_utils import flatten_model_params, weighted_average
+
 
 
 def estimate_q(
@@ -70,11 +71,10 @@ def build_variance_vector(
 def build_cost_matrix(
     cost_mode: str = "update",
     deltas: Optional[List[np.ndarray]] = None,
-    emd_matrix: Optional[np.ndarray] = None,
     D: Optional[np.ndarray] = None,
     eps: float = 1e-12,
 ) -> np.ndarray:
-    """Build median-normalized m x m pairwise distance/cost matrix D (`cost_mode` in {'update', 'emd'})."""
+    """Build median-normalized m x m pairwise update distance/cost matrix D (`cost_mode='update'`)."""
     cost_mode = cost_mode.strip().lower()
     if D is not None:
         raw_d = np.asarray(D, dtype=np.float64).copy()
@@ -85,12 +85,8 @@ def build_cost_matrix(
         if stacked.shape[0] == 1:
             return np.zeros((1, 1), dtype=np.float64)
         raw_d = squareform(pdist(stacked, metric="euclidean"))
-    elif cost_mode == "emd":
-        if emd_matrix is None:
-            raise ValueError("build_cost_matrix requires `emd_matrix` when cost_mode='emd'.")
-        raw_d = np.asarray(emd_matrix, dtype=np.float64).copy()
     else:
-        raise ValueError(f"Unsupported TCA cost_mode: {cost_mode}. Expected 'update' or 'emd'.")
+        raise ValueError(f"Unsupported TCA cost_mode: {cost_mode}. Expected 'update'.")
 
     raw_d = 0.5 * (raw_d + raw_d.T)
     np.fill_diagonal(raw_d, 0.0)
@@ -100,6 +96,7 @@ def build_cost_matrix(
     D_norm = raw_d / max(median_d, eps)
     np.fill_diagonal(D_norm, 0.0)
     return D_norm
+
 
 
 
@@ -311,32 +308,29 @@ def lazy_calibrate(
     return A_round, beta, target
 
 
-def tca_aggregate_split_models(
-    w_locals_client: List[dict],
-    w_locals_server: List[dict],
+def tca_aggregate_models(
+    w_locals: List[dict],
     A: np.ndarray,
     rho: np.ndarray,
     active_users: List[int],
-) -> Tuple[dict, dict, Dict[int, dict], Dict[int, dict]]:
-    """Aggregate client-half and server-half state_dicts; global model is sum_k rho_k * theta_k."""
+) -> Tuple[dict, Dict[int, dict]]:
+    """Aggregate complete client state_dicts using plan A; global model is sum_k rho_k * theta_k."""
     A = np.asarray(A, dtype=np.float64)
     rho = np.asarray(rho, dtype=np.float64)
     rho = rho / max(float(rho.sum()), 1e-12)
 
-    pers_client_by_id: Dict[int, dict] = {}
-    pers_server_by_id: Dict[int, dict] = {}
+    pers_models_by_id: Dict[int, dict] = {}
 
     for row_idx, cid in enumerate(active_users):
         cid_int = int(cid)
         row_weights = np.maximum(A[row_idx], 0.0)
         if float(row_weights.sum()) <= 0.0:
             row_weights = rho.copy()
-        pers_client_by_id[cid_int] = weighted_average(w_locals_client, row_weights)
-        pers_server_by_id[cid_int] = weighted_average(w_locals_server, row_weights)
+        pers_models_by_id[cid_int] = weighted_average(w_locals, row_weights)
 
-    w_glob_client = weighted_average(w_locals_client, rho)
-    w_glob_server = weighted_average(w_locals_server, rho)
+    w_glob = weighted_average(w_locals, rho)
 
-    return w_glob_client, w_glob_server, pers_client_by_id, pers_server_by_id
+    return w_glob, pers_models_by_id
+
 
 

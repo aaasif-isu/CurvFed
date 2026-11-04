@@ -3,18 +3,16 @@ import numpy as np
 import torch
 
 
-def flatten_split_params(
-    client_net: torch.nn.Module, server_net: torch.nn.Module
-) -> np.ndarray:
-    """Flatten trainable floating-point parameters of both client-half and server-half models."""
+def flatten_model_params(model: torch.nn.Module) -> np.ndarray:
+    """Flatten trainable floating-point parameters of a model into a 1D float64 vector."""
     vecs = []
-    for module in (client_net, server_net):
-        for p in module.parameters():
-            if p.is_floating_point():
-                vecs.append(p.detach().cpu().reshape(-1).to(dtype=torch.float64).numpy())
+    for p in model.parameters():
+        if p.is_floating_point():
+            vecs.append(p.detach().cpu().reshape(-1).to(dtype=torch.float64).numpy())
     if not vecs:
         return np.zeros(1, dtype=np.float64)
     return np.concatenate(vecs, axis=0)
+
 
 
 def FedAvg(w):
@@ -60,42 +58,3 @@ def weighted_average(state_dicts, weights):
 
     return avg_state
 
-
-def clusterwise_fedavg(server_weights_by_id, cluster_groups, dict_users=None):
-    """Aggregate server weights within clusters, then across clusters.
-
-    If `dict_users` is provided, uses sample-size weighting both within clusters
-    and across clusters (which algebraically simplifies to plain sample-weighted
-    FedAvg across all active clients). Otherwise uses uniform averaging within
-    each cluster and across clusters.
-    """
-    if not cluster_groups:
-        raise ValueError("cluster_groups is empty.")
-
-    cluster_models = []
-    cluster_sample_weights = []
-
-    for cluster_id, client_ids in sorted(cluster_groups.items()):
-        if len(client_ids) == 0:
-            continue
-
-        cluster_weights = [server_weights_by_id[int(cid)] for cid in client_ids]
-        if dict_users is not None:
-            client_sample_counts = [len(dict_users[int(cid)]) for cid in client_ids]
-            cluster_total_samples = int(sum(client_sample_counts))
-            cluster_model = weighted_average(cluster_weights, client_sample_counts)
-            cluster_models.append(cluster_model)
-            cluster_sample_weights.append(cluster_total_samples)
-        else:
-            cluster_model = FedAvg(cluster_weights)
-            cluster_models.append(cluster_model)
-
-    if len(cluster_models) == 0:
-        raise RuntimeError("No cluster models were produced during clusterwise_fedavg.")
-
-    if dict_users is not None:
-        final_global_model = weighted_average(cluster_models, cluster_sample_weights)
-    else:
-        final_global_model = FedAvg(cluster_models)
-
-    return final_global_model, cluster_models
