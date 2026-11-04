@@ -141,36 +141,60 @@ def partition_personalized_test_indices(
     num_classes: int,
     seed: int = 42,
 ):
-    """Partition test indices so each client's test set matches its local training class distribution."""
-    counts, _, _ = compute_label_histograms_and_tv(dict_users, train_labels, num_users, num_classes)
+    """Build each client's held-out test split in proportion to its own training class counts."""
+    counts, histograms, _ = compute_label_histograms_and_tv(
+        dict_users, train_labels, num_users, num_classes
+    )
     test_labels = np.asarray(test_labels, dtype=np.int64)
     rng = np.random.default_rng(seed + 500)
 
-    client_test_idcs = {i: [] for i in range(num_users)}
-    for c in range(num_classes):
-        class_test_indices = np.where(test_labels == c)[0]
-        if len(class_test_indices) == 0:
-            continue
-        rng.shuffle(class_test_indices)
-
-        col = counts[:, c].astype(np.float64)
-        col_sum = float(col.sum())
-        if col_sum > 0:
-            proportions = col / col_sum
-        else:
-            proportions = np.full(num_users, 1.0 / num_users, dtype=np.float64)
-
-        split_points = (np.cumsum(proportions)[:-1] * len(class_test_indices)).astype(int)
-        splits = np.split(class_test_indices, split_points)
-        for i in range(num_users):
-            client_test_idcs[i].extend(splits[i].tolist())
-
+    class_test_indices = {
+        c: np.where(test_labels == c)[0] for c in range(num_classes)
+    }
+    target_split_size = max(1, len(test_labels) // max(1, num_users))
     all_test = np.arange(len(test_labels), dtype=np.int64)
+
+    client_test_idcs = {i: [] for i in range(num_users)}
     for i in range(num_users):
-        if len(client_test_idcs[i]) == 0:
+        probs = histograms[i]
+        pos_classes = [
+            c for c in range(num_classes)
+            if probs[c] > 0.0 and len(class_test_indices[c]) > 0
+        ]
+        if not pos_classes:
             client_test_idcs[i] = rng.choice(
-                all_test, size=min(64, len(all_test)), replace=False
+                all_test, size=min(target_split_size, len(all_test)), replace=False
             ).tolist()
+            continue
+
+        # Cap client split size so no active class exceeds its available test pool,
+        # preserving exact proportionality to counts[i, c] without replacement.
+        max_unclipped_total = min(
+            len(class_test_indices[c]) / float(probs[c]) for c in pos_classes
+        )
+        client_total = min(float(target_split_size), float(max_unclipped_total))
+
+        sampled_for_client = []
+        for c in pos_classes:
+            n_c = int( np.round(client_total * float(probs[c])) )
+            if n_c <= 0 and counts[i, c] > 0 and client_total * float(probs[c]) >= 0.5:
+                n_c = 1
+            n_c = min(n_c, len(class_test_indices[c]))
+            if n_c > 0:
+                chosen_c = rng.choice(class_test_indices[c], size=n_c, replace=False)
+                sampled_for_client.extend(chosen_c.tolist())
+
+        if len(sampled_for_client) == 0:
+            dom_c = max(pos_classes, key=lambda c: probs[c])
+            chosen_c = rng.choice(
+                class_test_indices[dom_c],
+                size=min(len(class_test_indices[dom_c]), max(1, target_split_size)),
+                replace=False,
+            )
+            sampled_for_client.extend(chosen_c.tolist())
+
+        rng.shuffle(sampled_for_client)
+        client_test_idcs[i] = sampled_for_client
 
     return client_test_idcs
 

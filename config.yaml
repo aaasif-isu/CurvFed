@@ -1,101 +1,140 @@
 # =====================================================================
-# CurvFed Central Experiment Configuration (YAML)
+# CurvFed Single Experiment Configuration (config.yaml)
 # =====================================================================
-# Edit any parameter below and run:
-#   ./curvfed/bin/python scripts/run_experiment.py
-# Or specify a custom YAML file:
-#   ./curvfed/bin/python scripts/run_experiment.py --config config.yaml
+# Run with:
+#   python run.py
 # =====================================================================
 
-# ---------------------------------------------------------------------
-# 1. Aggregation Method & Run Mode
-# ---------------------------------------------------------------------
-# Options for method:
-#   - "baseline" / "fedavg": Standard SplitFedV1 (uniform FedAvg)
-#   - "emd_only"           : EMD distance matrix + Agglomerative Clustering
-#   - "emd_orc" / "curvfed": EMD + Ollivier-Ricci Curvature (ORC) shortest-path clustering
-#   - "emd_orc_weighted"   : Sample-weighted EMD + ORC clustering
-#   - "fedwad"             : Federated Wasserstein Distance (FedWaD / FedOTDD) clustering
-#   - "tca"                : Transport-Curvature Aggregation (Phase 2)
-method: "tca"
-
-# Set smoke_test: true for a fast CPU test preset (MNIST + SmallCNN, 4 clients, 2 rounds)
-smoke_test: false
+# Select one preset from `experiments` below (or set to "none" / "" to use base keys only):
+# Valid presets:
+#   debug, fedavg_debug, fedavg, tca_decoupled, tca_local, tca_vs0.01, tca_vs0.1, tca_vs10,
+#   curvfed_geometry, curvfed_random, tca_feedback_uncal, tca_feedback_cal
+experiment: "fedavg"
 
 # ---------------------------------------------------------------------
-# 2. Dataset & Split Model Architecture
+# Base Experiment Knobs (overridden by the selected preset above)
 # ---------------------------------------------------------------------
-# Valid (dataset, model) pairs:
-#   - dataset: "cifar10",     model: "resnet18" (or "smallcnn")
-#   - dataset: "mnist",       model: "resnet18" (or "smallcnn")
-#   - dataset: "shakespeare", model: "charlstm"
-dataset: "cifar10"
-model: "resnet18"
+method: "tca"               # "fedavg"/"baseline", "emd_only", "curvfed"/"emd_orc", "emd_orc_weighted", "fedwad", "tca"
+dataset: "cifar10"          # "cifar10", "mnist", "shakespeare"
+model: "resnet18"           # "resnet18", "smallcnn", "charlstm"
 
-# ---------------------------------------------------------------------
-# 3. Federated Client & Data Partition Settings
-# ---------------------------------------------------------------------
-num_users: 10           # Total number of clients (4, 10, or 100)
-frac: 1.0               # Fraction of active clients per round (e.g., 1.0 for 10 clients, 0.1 for 100 clients)
-alpha: 0.1              # Dirichlet non-IID parameter: 0.1, 0.5, 1.0, or 999999 (for IID)
-seed: 42                # Random seed for reproducibility
+num_users: 10               # Total number of clients
+frac: 1.0                   # Active client fraction per round (0 < frac <= 1.0)
+alpha: 0.1                  # Dirichlet non-IID concentration (e.g. 0.1, 0.5, 1.0, or 999999 for IID)
+seed: 42                    # Random seed
 
-# ---------------------------------------------------------------------
-# 4. Training Hyperparameters
-# ---------------------------------------------------------------------
-global_rounds: 50       # Number of global communication rounds
-local_epochs: 1         # Number of local epochs per active client per round
-learning_rate: 0.0001   # Adam optimizer learning rate (client & server)
-batch_size: 256         # Training and evaluation batch size
+global_rounds: 50           # Number of global training rounds
+local_epochs: 1             # Number of local epochs per client per round
+lr: 0.0001                  # Learning rate
+batch_size: 256             # Batch size
 
-# Optional sample caps (set to null for full dataset, or an integer like 512 for quick tests)
+n_clusters: 3               # Number of client clusters for CurvFed / EMD methods
+cluster_mode: "geometry"    # "geometry" or "random"
+zscore_mode: "pooled"       # "per_client", "pooled", or "none"
+distance_method: "emd"      # "emd" or "fedwad"
+
+consistent_split_weights: true
+run_noise_floor: true
+save_excel: true
 max_samples_per_client: null
 max_test_samples: null
 
-# ---------------------------------------------------------------------
-# 5. CurvFed Geometry, Clustering & Sanity-Check Controls
-# ---------------------------------------------------------------------
-n_clusters: 3                      # Number of client clusters per round (1 <= n_clusters <= active clients)
-cluster_mode: "geometry"           # "geometry" (true EMD/ORC clusters) or "random" (random clusters of same sizes)
-zscore_mode: "pooled"              # Activation normalization before EMD: "per_client", "pooled", or "none"
-consistent_split_weights: true     # true: clusterwise_fedavg on both client & server; false: server only
-run_noise_floor: true              # true: run Sanity Check A (within- vs cross-client EMD SNR)
-
-# ---------------------------------------------------------------------
-# 5b. Phase 2: Transport-Curvature Aggregation (TCA) Controls
-# ---------------------------------------------------------------------
+# TCA parameters
 tca:
-  mode: "decoupled"         # "decoupled" (start from global model) or "feedback" (start from personalized model)
-  cost: "update"            # "update" (pairwise delta L2 distance) or "emd" (smashed activation EMD)
-  marginal: "hard"          # "hard" (doubly stochastic), "unbalanced" (KL rel_entr with tau), or "none" (row-only)
-  calibrate: false          # true: apply lazy_calibrate(A, median_q, kappa_target) before aggregating
-  kappa_target: "auto"      # "auto" (= mean kappa of uncalibrated plan) or a float number (e.g. 0.25)
+  mode: "decoupled"         # "decoupled" or "feedback"
+  cost: "update"            # "update" or "emd"
+  marginal: "hard"          # "hard", "unbalanced", or "none"
+  tau: 1.0                  # KL penalty weight when marginal: "unbalanced"
   var_scale: 1.0            # Per-client variance weight scale: v_k = var_scale * mean(n) / n_k
-  tau: 1.0                  # Unbalanced column marginal KL penalty weight (used when marginal: "unbalanced")
+  calibrate: false          # true or false (lazy_calibrate in feedback mode)
+  kappa_target: "auto"      # "auto" (= mean kappa of uncalibrated plan) or float
 
 # ---------------------------------------------------------------------
-# 6. Output & Logging Settings
+# Named Experiment Presets (deep-merged over the base keys above)
 # ---------------------------------------------------------------------
-output_dir: null        # null = auto-generate under results/, or set e.g. "results/my_experiment"
-save_excel: true        # Save .xlsx workbook in addition to round_metrics.csv
+experiments:
+  debug:
+    dataset: "mnist"
+    model: "smallcnn"
+    num_users: 4
+    frac: 1.0
+    n_clusters: 2
+    global_rounds: 2
+    batch_size: 64
+    lr: 0.001
+    max_samples_per_client: 512
+    max_test_samples: 1024
+    smoke_test: true
+    method: "tca"
 
-# ---------------------------------------------------------------------
-# 7. FedWaD Settings (used when method: "fedwad" or running SplitFed_EMD_FedWaD.py)
-# ---------------------------------------------------------------------
-distance_method: "fedwad"   # "emd" or "fedwad"
-fedwad_n_supp: 10           # Number of interpolating measure support points
-fedwad_epochs: 20           # Optimization epochs for free-support interpolating measure
-fedwad_t: 0.5               # Interpolation parameter t in (0, 1)
-distance_pool_size: 1       # Adaptive average pooling spatial size for 2D feature maps
+  fedavg_debug:
+    method: "fedavg"
+    dataset: "mnist"
+    model: "smallcnn"
+    num_users: 4
+    frac: 1.0
+    n_clusters: 2
+    global_rounds: 2
+    batch_size: 64
+    lr: 0.001
+    max_samples_per_client: 512
+    max_test_samples: 1024
+    smoke_test: true
 
-# ---------------------------------------------------------------------
-# 8. Fixed Dataset Paths & CharLSTM Architecture Settings
-# ---------------------------------------------------------------------
-data_root: "data"
-shakespeare_text_path: "data/shakespeare/input.txt"
-shakespeare_download_url: "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
-shakespeare_train_fraction: 0.9
-shakespeare_sequence_length: 80
-charlstm_embed_dim: 8
-charlstm_hidden_size: 256
-charlstm_num_layers: 2
+  fedavg:
+    method: "fedavg"
+
+  tca_decoupled:
+    method: "tca"
+    tca:
+      mode: "decoupled"
+      cost: "update"
+      marginal: "hard"
+
+  tca_local:
+    method: "tca"
+    tca:
+      mode: "decoupled"
+      marginal: "none"
+      var_scale: 1.0e-6
+
+  tca_vs0.01:
+    method: "tca"
+    tca:
+      mode: "decoupled"
+      var_scale: 0.01
+
+  tca_vs0.1:
+    method: "tca"
+    tca:
+      mode: "decoupled"
+      var_scale: 0.1
+
+  tca_vs10:
+    method: "tca"
+    tca:
+      mode: "decoupled"
+      var_scale: 10.0
+
+  curvfed_geometry:
+    method: "curvfed"
+    cluster_mode: "geometry"
+    zscore_mode: "pooled"
+
+  curvfed_random:
+    method: "curvfed"
+    cluster_mode: "random"
+    zscore_mode: "pooled"
+
+  tca_feedback_uncal:
+    method: "tca"
+    tca:
+      mode: "feedback"
+      calibrate: false
+
+  tca_feedback_cal:
+    method: "tca"
+    tca:
+      mode: "feedback"
+      calibrate: true
+

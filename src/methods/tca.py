@@ -192,13 +192,12 @@ def solve_tca_plan(
     if A.value is None:
         prob.solve(solver=cp.SCS)
 
-    A_val = np.asarray(A.value, dtype=np.float64)
+    A_val = np.ascontiguousarray(A.value, dtype=np.float64)
     A_val = np.maximum(A_val, 0.0)
     A_val[A_val < 1e-7] = 0.0
     row_sums = A_val.sum(axis=1, keepdims=True)
     A_val = np.where(row_sums > 1e-12, A_val / np.maximum(row_sums, 1e-12), rho[None, :])
-    return A_val
-
+    return np.ascontiguousarray(A_val, dtype=np.float64)
 
 
 def plan_curvature(
@@ -209,15 +208,15 @@ def plan_curvature(
     violation_tol: float = 1e-7,
 ) -> Dict[str, Union[float, int, np.ndarray]]:
     """Compute pairwise Ollivier-Ricci curvature of plan A under ground metric D."""
-    A = np.asarray(A, dtype=np.float64)
+    A = np.ascontiguousarray(A, dtype=np.float64)
     metric_d = D if D is not None else C
     if metric_d is None:
         raise ValueError("plan_curvature requires ground metric `D`.")
-    D_mat = np.asarray(metric_d, dtype=np.float64)
+    D_mat = np.ascontiguousarray(metric_d, dtype=np.float64)
     m = A.shape[0]
 
     row_sums = np.maximum(A.sum(axis=1, keepdims=True), 1e-12)
-    A_norm = A / row_sums
+    A_norm = np.ascontiguousarray(A / row_sums, dtype=np.float64)
     b = np.sum(A_norm * D_mat, axis=1)
 
     sparsity = float(np.mean(np.abs(A) <= zero_tol))
@@ -245,13 +244,13 @@ def plan_curvature(
                     metric_violations += 1
 
     for i in range(m):
-        ai = A_norm[i]
+        ai = np.ascontiguousarray(A_norm[i], dtype=np.float64)
         for j in range(i + 1, m):
             dij = float(D_mat[i, j])
             if dij <= 1e-12:
                 kij = 1.0
             else:
-                aj = A_norm[j]
+                aj = np.ascontiguousarray(A_norm[j], dtype=np.float64)
                 w1 = float(ot.emd2(ai, aj, D_mat))
                 kij = 1.0 - (w1 / dij)
                 upper_bound = (float(b[i]) + float(b[j])) / dij

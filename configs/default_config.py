@@ -137,6 +137,7 @@ class ExperimentConfig:
     tca_kappa_target: Union[str, float] = TCA_KAPPA_TARGET
     tca_var_scale: float = TCA_VAR_SCALE
     tca_tau: float = TCA_TAU
+    experiment: str = "none"
 
     @property
     def tca_reg(self) -> float:
@@ -337,8 +338,19 @@ _YAML_KEY_ALIASES = {
 }
 
 
+def _deep_merge_dicts(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """Deep-merge `override` into a copy of `base` (merging nested dicts like `tca`)."""
+    merged = dict(base)
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(merged.get(k), dict):
+            merged[k] = _deep_merge_dicts(merged[k], v)
+        else:
+            merged[k] = v
+    return merged
+
+
 def load_config_from_yaml(yaml_path: Union[str, os.PathLike] = DEFAULT_YAML_PATH) -> ExperimentConfig:
-    """Load an `ExperimentConfig` from a YAML file."""
+    """Load an `ExperimentConfig` from a YAML file with preset resolution (`experiment` + `experiments`)."""
     path = Path(yaml_path)
     if not path.exists():
         raise FileNotFoundError(f"YAML configuration file not found: {path}")
@@ -349,9 +361,33 @@ def load_config_from_yaml(yaml_path: Union[str, os.PathLike] = DEFAULT_YAML_PATH
     if not isinstance(raw_data, dict):
         raise ValueError(f"YAML config at {path} must be a top-level key-value mapping.")
 
+    raw_data = dict(raw_data)
+    experiments_map = raw_data.pop("experiments", None) or {}
+    if not isinstance(experiments_map, dict):
+        raise ValueError(f"'experiments' in {path} must be a mapping of preset names to dicts.")
+
+    raw_exp = raw_data.pop("experiment", None)
+    selected_exp = "" if raw_exp is None else str(raw_exp).strip()
+
+    if selected_exp and selected_exp.lower() not in ("none", "null"):
+        if selected_exp not in experiments_map:
+            valid_names = sorted(experiments_map.keys())
+            raise ValueError(
+                f"Unknown experiment preset '{selected_exp}' in {path}. "
+                f"Valid preset names are: {valid_names} (or 'none' / '')."
+            )
+        preset_dict = experiments_map[selected_exp] or {}
+        if not isinstance(preset_dict, dict):
+            raise ValueError(f"Preset '{selected_exp}' in {path} must be a mapping.")
+        merged_raw = _deep_merge_dicts(raw_data, preset_dict)
+        resolved_exp_name = selected_exp
+    else:
+        merged_raw = raw_data
+        resolved_exp_name = "none"
+
     valid_field_names = {f.name for f in fields(ExperimentConfig)}
-    normalized: Dict[str, Any] = {}
-    for k, v in raw_data.items():
+    normalized: Dict[str, Any] = {"experiment": resolved_exp_name}
+    for k, v in merged_raw.items():
         raw_k = str(k).strip().lower()
         if raw_k == "tca" and isinstance(v, dict):
             for sub_k, sub_v in v.items():
@@ -421,7 +457,7 @@ def load_config_from_yaml(yaml_path: Union[str, os.PathLike] = DEFAULT_YAML_PATH
         smoke_overrides = {
             k: normalized[k]
             for k in (
-                "method", "cluster_mode", "zscore_mode", "consistent_split_weights",
+                "experiment", "method", "cluster_mode", "zscore_mode", "consistent_split_weights",
                 "run_noise_floor", "output_dir", "save_excel", "seed",
                 "tca_mode", "tca_cost", "tca_marginal", "tca_calibrate",
                 "tca_kappa_target", "tca_var_scale", "tca_tau",
